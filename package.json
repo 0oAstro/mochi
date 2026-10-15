@@ -2,13 +2,15 @@
   "name": "mochi",
   "private": true,
   "type": "module",
+  "bin": {
+    "mochi": "src/main.ts"
+  },
   "engines": {
     "node": ">=24"
   },
   "scripts": {
     "start": "node src/main.ts",
     "chat": "node src/main.ts chat",
-    "test": "node --test --test-timeout=60000 'src/**/*.test.ts' 'eval/**/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -20,7 +22,6 @@
     "@earendil-works/pi-mcp": "1.2.0",
     "@earendil-works/pi-tui": "1.2.0",
     "defuddle": "0.19.3",
-    "grammy": "1.46.0",
     "linkedom": "0.18.13",
     "smol-toml": "1.9.0",
     "spectrum-ts": "12.10.1",

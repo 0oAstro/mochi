@@ -3,15 +3,12 @@ import { join } from "node:path";
 import { defineExtension, type Extension, section } from "@earendil-works/pi-durable";
 import { parse } from "yaml";
 
-export interface SkillLine {
+interface SkillLine {
 	readonly name: string;
 	readonly description: string;
 }
 
-const DESCRIPTION_CHARS = 120;
-
-/** `<dir>/<name>/SKILL.md` frontmatter, sorted by name. */
-export async function readSkills(dir: string): Promise<readonly SkillLine[]> {
+async function readSkills(dir: string): Promise<readonly SkillLine[]> {
 	const names = (await readdir(dir).catch(() => [])).sort();
 	const skills: SkillLine[] = [];
 	for (const name of names) {
@@ -43,6 +40,6 @@ export function skillsExtension(dir: string): Extension {
 
 function indexText(dir: string, skills: readonly SkillLine[]): string | undefined {
 	if (skills.length === 0) return undefined;
-	const lines = skills.map(({ name, description }) => `${name}: ${description.length > DESCRIPTION_CHARS ? `${description.slice(0, DESCRIPTION_CHARS - 1)}…` : description}`);
+	const lines = skills.map(({ name, description }) => `${name}: ${description}`);
 	return [`Skills, each at ${dir}/<name>/SKILL.md; read one before following it.`, ...lines].join("\n");
 }

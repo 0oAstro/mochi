@@ -1,26 +1,25 @@
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { mkdir, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Context } from "@earendil-works/chord";
 import { type Static, Type } from "@earendil-works/pi-ai";
 import { defineTask, defineTool, type NextTaskState, ROOT_CONVERSATION_ID, type Task, type TaskId, type ToolExecutionApi, type ToolRegistration, type TaskRuntime } from "@earendil-works/pi-durable";
+import { type Committer, holdText } from "../context.ts";
+import type { ChatChannelId } from "../channels/types.ts";
 import type { Log } from "../log.ts";
 import { allPages } from "../pages.ts";
 import { parseWith } from "../parse.ts";
-import { clip } from "../text.ts";
 import { LastInboundDoc, type Line, openTurn } from "../turn/turn.ts";
 
 export const PROC_POLL_MS = 1000;
 const WAKE_LINES = 30;
-const LINE_CHARS = 300;
 const TAIL_BYTES = 256 * 1024;
 const STOP_GRACE_MS = 3000;
 
 const KIND = "mochi.proc";
 
-/** The wrapper keeps running through a TERM to its group, so it can write the exit code once the command ends. */
 const WRAPPER = `trap 'true' TERM INT HUP
 sh -c "$1"
 code=$?
@@ -41,7 +40,7 @@ type Meta = Static<typeof MetaSchema>;
 type ProcInput = { readonly name: string; readonly pid: number; readonly watch?: string };
 type ProcState = { readonly phase: "watch"; readonly fired: boolean };
 type ProcResult = { readonly code: number | null };
-export type ProcTask = Task<ProcInput, ProcState, ProcResult, object>;
+type ProcTask = Task<ProcInput, ProcState, ProcResult, object>;
 
 type Status = { readonly state: "running" } | { readonly state: "exited"; readonly code: number } | { readonly state: "lost" };
 
@@ -83,24 +82,6 @@ async function readMeta(files: ProcFiles): Promise<Meta | undefined> {
 	return parseWith(MetaSchema, JSON.parse(text), files.meta);
 }
 
-/** The last `count` lines of the log, read from at most its last TAIL_BYTES. */
-async function tailLines(path: string, count: number): Promise<string[]> {
-	const file = await open(path, "r").catch(() => undefined);
-	if (file === undefined) return [];
-	try {
-		const { size } = await file.stat();
-		const length = Math.min(size, TAIL_BYTES);
-		const buffer = Buffer.alloc(length);
-		await file.read(buffer, 0, length, size - length);
-		const lines = buffer.toString("utf8").split("\n");
-		if (lines.at(-1) === "") lines.pop();
-		return lines.slice(-count);
-	} finally {
-		await file.close();
-	}
-}
-
-/** Bytes appended to the log since `offset`. */
 async function readFrom(path: string, offset: number): Promise<Buffer> {
 	const file = await open(path, "r").catch(() => undefined);
 	if (file === undefined) return Buffer.alloc(0);
@@ -115,7 +96,13 @@ async function readFrom(path: string, offset: number): Promise<Buffer> {
 	}
 }
 
-/** TERM to the whole group, KILL after a grace period. Writes 137 when the wrapper died before it wrote a code. */
+async function tailLines(path: string, count: number): Promise<string[]> {
+	const size = (await stat(path).catch(() => undefined))?.size ?? 0;
+	const lines = (await readFrom(path, Math.max(0, size - TAIL_BYTES))).toString("utf8").split("\n");
+	if (lines.at(-1) === "") lines.pop();
+	return lines.slice(-count);
+}
+
 async function stopGroup(pid: number, files: ProcFiles): Promise<void> {
 	if (!signal(-pid, 0)) return;
 	signal(-pid, "SIGTERM");
@@ -128,15 +115,12 @@ async function stopGroup(pid: number, files: ProcFiles): Promise<void> {
 	if ((await exitCode(files)) === undefined) await writeFile(files.exit, "137\n");
 }
 
-/** Under systemd, a scope of its own keeps the process alive when the daemon's unit stops or restarts. */
-function launcher(argv: readonly string[]): { file: string; args: string[] } {
-	if (process.env.INVOCATION_ID === undefined) return { file: argv[0]!, args: argv.slice(1) };
-	return { file: "systemd-run", args: ["--user", "--scope", "--quiet", "--collect", "--", ...argv] };
-}
-
 async function startProcess(files: ProcFiles, command: string, cwd: string): Promise<number> {
 	await rm(files.exit, { force: true });
-	const { file, args } = launcher(["sh", "-c", WRAPPER, "mochi-proc", command, files.exit]);
+	const argv = ["sh", "-c", WRAPPER, "mochi-proc", command, files.exit];
+	const underSystemd = process.env.INVOCATION_ID !== undefined;
+	const file = underSystemd ? "systemd-run" : "sh";
+	const args = underSystemd ? ["--user", "--scope", "--quiet", "--collect", "--", ...argv] : argv.slice(1);
 	const log = openSync(files.log, "w");
 	let child;
 	try {
@@ -161,13 +145,10 @@ function checkPattern(watch: string): void {
 	}
 }
 
-function wakeBody(lines: readonly string[]): string {
-	if (lines.length === 0) return "(no output)";
-	return lines.map((line) => clip(line, LINE_CHARS)).join("\n");
-}
-
-export interface ProcWatchDeps {
+interface ProcWatchDeps {
 	readonly dir: string;
+	readonly workDir: string;
+	readonly harness: () => Committer;
 	readonly line: () => Line;
 	readonly pollMs: number;
 	readonly log: Log;
@@ -175,26 +156,32 @@ export interface ProcWatchDeps {
 
 type ProcRuntime = TaskRuntime<ProcInput, ProcState, ProcResult, object>;
 
-/**
- * The watcher. A wake into root goes through a chat Turn on the owner's last chat channel, so the reply reaches
- * them; any other conversation, or a root with no chat yet, gets the input directly. Both use a request id per task
- * and event, so a rerun after a crash delivers nothing twice.
- */
+/** A wake's text and destination, fixed on first run so a replay submits the same content to the same place. */
+type WakeMemo = { readonly tag: string; readonly body: string; readonly last: { readonly channel: ChatChannelId; readonly messageId: string } | null };
+
+/** A wake into root goes through a chat Turn on the owner's last chat channel, so the reply reaches them. */
 export function defineProcWatch(deps: ProcWatchDeps): ProcTask {
-	const wake = async (task: { readonly id: TaskId }, runtime: ProcRuntime, event: "watch" | "exit", tag: string, body: string, next: NextTaskState<ProcState, ProcResult>, context: Context) => {
+	const wake = async (task: { readonly id: TaskId }, runtime: ProcRuntime, event: "watch" | "exit", tag: string, files: ProcFiles, next: NextTaskState<ProcState, ProcResult>, context: Context) => {
 		const key = `proc:${task.id}:${event}`;
 		deps.log("proc.wake", { task: task.id, event, tag });
-		const last = runtime.conversationId === ROOT_CONVERSATION_ID ? (await runtime.snapshot(LastInboundDoc, context))?.last : undefined;
-		if (last !== undefined && last !== null) {
+		let frozen = await runtime.memo<WakeMemo>(`wake:${event}`, context);
+		if (frozen === undefined) {
+			const lines = await tailLines(files.log, WAKE_LINES);
+			const text = lines.length === 0 ? "(no output)" : lines.join("\n");
+			const last = runtime.conversationId === ROOT_CONVERSATION_ID ? (await runtime.snapshot(LastInboundDoc, context))?.last : undefined;
+			frozen = await runtime.memo<WakeMemo>(`wake:${event}`, { tag, body: text, last: last ?? null }, context);
+		}
+		const { body, last } = frozen;
+		if (last !== null) {
 			await runtime.commit(async (tx) => {
-				await openTurn(tx, deps.line(), { source: "chat", channel: last.channel, key, tag, text: body, files: [] });
+				await openTurn(tx, deps.line(), { source: "chat", channel: last.channel, key, tag: frozen.tag, text: body, files: [] });
 				return next;
 			}, context);
 			return;
 		}
-		const conversation = await runtime.conversation(runtime.conversationId, context);
-		if (conversation === undefined) throw new Error(`Conversation ${runtime.conversationId} is missing.`);
-		await conversation.submit({ type: "input", content: `${tag}\n${body}`, requestId: key, whenBusy: "followUp" }, context);
+		const conversation = (await runtime.conversation(runtime.conversationId, context))!;
+		const held = await holdText(deps.harness(), deps.workDir, conversation.id, `in:${key}`, body, context);
+		await conversation.submit({ type: "input", content: `${frozen.tag}\n${held}`, requestId: key, whenBusy: "followUp" }, context);
 		await runtime.commit(() => next, context);
 	};
 
@@ -219,15 +206,13 @@ export function defineProcWatch(deps: ProcWatchDeps): ProcTask {
 						partial = ended ? "" : lines.pop()!;
 						if (lines.some((line) => pattern.test(line))) {
 							const tag = `[process ${name} matched /${watch}/, ${ended ? "now ended" : "still running"}]`;
-							const body = wakeBody(await tailLines(files.log, WAKE_LINES));
-							return wake(task, runtime, "watch", tag, body, { status: "running", checkpoint: { phase: "watch", fired: true } }, context);
+							return wake(task, runtime, "watch", tag, files, { status: "running", checkpoint: { phase: "watch", fired: true } }, context);
 						}
 					}
 					if (ended) {
 						const code = status.state === "exited" ? status.code : null;
 						const tag = code === null ? `[process ${name} ended, exit code unknown]` : `[process ${name} exited code=${code}]`;
-						const body = wakeBody(await tailLines(files.log, WAKE_LINES));
-						return wake(task, runtime, "exit", tag, body, { status: "terminal", outcome: { status: "completed", result: { code } } }, context);
+						return wake(task, runtime, "exit", tag, files, { status: "terminal", outcome: { status: "completed", result: { code } } }, context);
 					}
 					await runtime.sleep(runtime.now() + deps.pollMs, context);
 				}
@@ -240,10 +225,9 @@ export function defineProcWatch(deps: ProcWatchDeps): ProcTask {
 	});
 }
 
-export interface ProcFnDeps {
+interface ProcFnDeps {
 	readonly task: ProcTask;
 	readonly dir: string;
-	/** Where a relative `cwd` resolves, and the default one. */
 	readonly workDir: string;
 	readonly abortTask: (id: TaskId, context: Context) => Promise<unknown>;
 }
@@ -259,17 +243,12 @@ const StatusRow = Type.Object({
 });
 
 export function procFns(deps: ProcFnDeps): ToolRegistration[] {
-	const liveWatchers = async (api: ToolExecutionApi, name: string, context: Context): Promise<TaskId[]> => {
-		const found: TaskId[] = [];
-		await api.commit(async (tx) => {
+	const liveWatchers = (api: ToolExecutionApi, name: string, context: Context): Promise<TaskId[]> =>
+		api.commit(async (tx) => {
 			const tasks = await allPages((cursor) => tx.scanTasks({ kind: KIND }, 256, cursor));
-			for (const task of tasks) {
-				const input = task.input as ProcInput;
-				if (input.name === name && task.state.status !== "terminal") found.push(task.id);
-			}
+			const live = tasks.filter((task) => (task.input as ProcInput).name === name && task.state.status !== "terminal");
+			return live.map((task) => task.id);
 		}, context);
-		return found;
-	};
 
 	return [
 		defineTool({
@@ -319,7 +298,7 @@ export function procFns(deps: ProcFnDeps): ToolRegistration[] {
 		defineTool({
 			name: "proc_logs",
 			description: "The last lines of a background process's output, stdout and stderr together.",
-			parameters: Type.Object({ name: Name, tail: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })) }),
+			parameters: Type.Object({ name: Name, tail: Type.Optional(Type.Integer({ minimum: 1 })) }),
 			structuredOutputSchema: Type.String(),
 			replay: "safe",
 			execute: async ({ name, tail }) => {

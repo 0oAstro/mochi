@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -8,194 +10,272 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { openMochi } from "./mochi.ts";
 import { createClassify } from "./brain/classifier.ts";
 import { createIMessageChannel } from "./channels/imessage.ts";
-import { createTelegramChannel } from "./channels/telegram.ts";
 import { createWhatsAppChannel } from "./channels/whatsapp.ts";
 import type { Channel, Channels, ChatChannelId, Env, InboundSink } from "./channels/types.ts";
-import { type Config, type ChatUser, loadConfig } from "./config.ts";
-import { resolveHome } from "./home.ts";
-import { migrate } from "./migrate.ts";
+import { type Config, unknownKeys, type ChatUser, loadConfig } from "./config.ts";
+import { type Home, resolveHome } from "./home.ts";
 import { SearchIndex } from "./index/fts.ts";
 import { acquireLock } from "./lock.ts";
 import { log, setLogFile } from "./log.ts";
 import { broken, off, ready, type Setup, setupReport } from "./setup.ts";
-import { listenAttach } from "./attach/server.ts";
-import { AttachClient } from "./attach/client.ts";
+import { type DaemonFacts, listenAttach, modelSummaries } from "./attach/server.ts";
+import type { AttachClient } from "./attach/client.ts";
+import { doctor, reach, stopDaemon } from "./attach/daemon.ts";
+import { printModels, runAgents, runExport, runStatus, table } from "./attach/inspect.ts";
+import { type Cli, helpText, parseCli } from "./cli.ts";
+import type { ModelRef } from "@earendil-works/pi-durable";
 import { runLines } from "./attach/lines.ts";
 import { runTui } from "./attach/tui.ts";
-import { AgentCatalog } from "./agents/catalog.ts";
+import { Profiles } from "./profiles/profiles.ts";
 import { triggersComponent } from "./triggers/webhooks.ts";
 import { a2aComponent, a2aServerSetup } from "./a2a/server.ts";
-import { AUTH_COMMAND, authFile, loginExecutor, storedTokenConnector } from "./auth/executor.ts";
+import { AUTH_COMMAND, authFile, loginApps, storedTokenConnector } from "./auth/apps.ts";
 import { connectApps } from "./apps/apps.ts";
-import { InboundCursorDoc, ingest } from "./turn/turn.ts";
+import { ingest } from "./turn/turn.ts";
 import { runFeed } from "./memory/feed.ts";
+import { watchCompaction } from "./memory/compact.ts";
+import { fastCompletion } from "./turn/lifecycle.ts";
 
 /** Only iMessage serves users; the other adapters stay owner-only. */
 const ADAPTERS: Readonly<Record<ChatChannelId, (env: Env, users: readonly ChatUser[]) => Setup<Channel>>> = {
-	imessage: (env, users) => createIMessageChannel(env, { users: users.map((user) => user.handle) }),
-	telegram: (env) => createTelegramChannel(env),
+	imessage: (env, users) => createIMessageChannel(env, users.map((user) => user.handle)),
 	whatsapp: (env) => createWhatsAppChannel(env),
 };
 
 const REPO = resolve(import.meta.dirname, "..");
 
-type Mode =
-	| { readonly kind: "daemon" }
-	| { readonly kind: "tui" }
-	/** Chat (stdin lines) or print (one prompt); `json` streams view frames instead of replies. */
-	| { readonly kind: "lines"; readonly prompt?: string; readonly json: boolean; readonly id?: string };
-
-const USAGE = "Usage: mochi [--headless] | mochi chat [--json] [--id <key>] | mochi -p <prompt> [--json] [--id <key>] | " + AUTH_COMMAND;
-
-export function parseMode(all: readonly string[], interactive: boolean): Mode {
-	const idAt = all.indexOf("--id");
-	const id = idAt < 0 ? undefined : all[idAt + 1];
-	if (idAt >= 0 && (id === undefined || !/^[A-Za-z0-9._-]+$/.test(id))) throw new Error(`--id needs a key of letters, digits, dot, dash or underscore. ${USAGE}`);
-	const args = idAt < 0 ? all : [...all.slice(0, idAt), ...all.slice(idAt + 2)];
-	const json = args.includes("--json");
-	const rest = args.filter((arg) => arg !== "--json");
-	if (rest.length === 0) return interactive && !json ? { kind: "tui" } : json ? { kind: "lines", json } : { kind: "daemon" };
-	if (rest.length === 1 && rest[0] === "--headless") return { kind: "daemon" };
-	const keyed = id === undefined ? {} : { id };
-	if (rest.length === 1 && rest[0] === "chat") return { kind: "lines", json, ...keyed };
-	if (rest.length === 2 && (rest[0] === "-p" || rest[0] === "--print")) return { kind: "lines", prompt: rest[1]!, json, ...keyed };
-	throw new Error(`Unknown arguments: ${args.join(" ")}. ${USAGE}`);
+async function main(cli: Cli): Promise<number> {
+	const home = resolveHome(process.env);
+	const socket = socketPath(home.dir);
+	switch (cli.kind) {
+		case "help":
+			process.stdout.write(`${helpText(cli.command)}\n`);
+			return 0;
+		case "service-install":
+			await installService(home);
+			return 0;
+		case "auth-apps": {
+			const config = await loadConfig(process.env);
+			if (config.appsUrl === undefined) throw new Error("Set appsUrl in config.toml (or MOCHI_APPS_URL) first.");
+			await mkdir(config.home.dir, { recursive: true });
+			await loginApps(config.appsUrl, authFile(config.home.dir), (line) => process.stdout.write(`${line}\n`));
+			return 0;
+		}
+		case "daemon": {
+			const config = await loadConfig(process.env);
+			await mkdir(config.home.dir, { recursive: true });
+			const daemon = await startDaemon(config, "configured");
+			stopOnSignal(daemon, () => {});
+			return new Promise<number>(() => {});
+		}
+		case "stop":
+			return stopDaemon(home, socket);
+		case "doctor": {
+			const checks = await doctor(home, socket);
+			if (cli.json) process.stdout.write(`${JSON.stringify(checks)}\n`);
+			else process.stdout.write(`${table(checks.map((check) => [check.level, check.name, check.detail]))}\n`);
+			return checks.some((check) => check.level === "fail") ? 1 : 0;
+		}
+		case "models": {
+			const found = await reach(socket, false);
+			if (found.kind === "refused") throw new Error(found.reason);
+			if (found.kind === "ready") {
+				printModels(await found.client.request({ op: "models" }), cli.search, cli.json);
+				found.client.close();
+				return 0;
+			}
+			const config = await loadConfig(process.env);
+			printModels(modelSummaries(config.modelSetup.models, modelRoles(config)), cli.search, cli.json);
+			return 0;
+		}
+		case "agents":
+		case "status":
+		case "export":
+			return inspect(socket, async (client) => {
+				if (cli.kind === "agents") await runAgents(client, cli.json);
+				else if (cli.kind === "status") await runStatus(client, cli.json);
+				else await runExport(client, cli.to, cli.out);
+			});
+		case "tui":
+		case "lines":
+			return attach(cli, home, socket);
+		default: {
+			const _exhaustive: never = cli;
+			throw new Error(`Unhandled command ${JSON.stringify(_exhaustive)}`);
+		}
+	}
 }
 
-async function main(args: readonly string[]): Promise<void> {
-	if (args[0] === "service" && args[1] === "install") {
-		// Linux: a systemd user service for this home, started now and at login.
-		const home = resolveHome(process.env);
-		if (process.platform !== "linux") throw new Error("service install writes a systemd user unit, which needs Linux. Run node src/main.ts --headless under your own supervisor.");
-		const unit = [
-			"[Unit]",
-			"Description=mochi",
-			"After=network-online.target",
-			"StartLimitIntervalSec=0",
-			"",
-			"[Service]",
-			"Type=simple",
-			`WorkingDirectory=${REPO}`,
-			`Environment=MOCHI_HOME=${home.dir}`,
-			`Environment=PATH=${process.env.PATH ?? "/usr/bin:/bin"}`,
-			`ExecStart=${process.execPath} src/main.ts --headless`,
-			"Restart=always",
-			"RestartSec=5",
-			`StandardOutput=append:${home.logFile}`,
-			`StandardError=append:${home.logFile}`,
-			"UMask=0077",
-			"",
-			"[Install]",
-			"WantedBy=default.target",
-			"",
-		].join("\n");
-		const dir = join(homedir(), ".config", "systemd", "user");
-		await mkdir(dir, { recursive: true });
-		await mkdir(home.dir, { recursive: true });
-		await writeFile(join(dir, "mochi.service"), unit);
-		process.stdout.write(`Wrote ${join(dir, "mochi.service")}. Start it: systemctl --user daemon-reload && systemctl --user enable --now mochi\n`);
-		return;
+/** Commands that only read: they need a running daemon and never become one. */
+async function inspect(socket: string, run: (client: AttachClient) => Promise<void>): Promise<number> {
+	const found = await reach(socket, false);
+	if (found.kind === "refused") throw new Error(found.reason);
+	if (found.kind === "absent") {
+		process.stderr.write("mochi is not running.\n");
+		return 1;
 	}
-	if (args[0] === "migrate") {
-		// mochi migrate <old data dir> [old env file]: once, with the daemon stopped.
-		const [from, envFile] = args.slice(1);
-		if (from === undefined) throw new Error("Usage: mochi migrate <old data dir> [old env file]");
-		const home = resolveHome(process.env);
-		for (const line of migrate({ from: resolve(from), ...(envFile === undefined ? {} : { envFile: resolve(envFile) }), home })) process.stdout.write(`${line}\n`);
-		return;
+	try {
+		await run(found.client);
+	} finally {
+		found.client.close();
 	}
-	if (args[0] === "auth") {
-		if (args[1] !== "executor") throw new Error(`Unknown auth target ${args[1] ?? "(none)"}. Usage: ${AUTH_COMMAND}`);
+	return 0;
+}
+
+// A terminal attaches to the running daemon. Without one, this process becomes the daemon for as long as the
+// terminal runs: every channel for the TUI, only the terminal for chat and print. attach needs a running daemon.
+async function attach(cli: Extract<Cli, { kind: "tui" | "lines" }>, home: Home, socket: string): Promise<number> {
+	const watch = cli.kind === "tui" || cli.json;
+	let found = await reach(socket, watch);
+	if (found.kind === "refused") throw new Error(found.reason);
+	let local: Daemon | undefined;
+	if (found.kind === "absent") {
+		if (cli.kind === "tui" && cli.to !== undefined) {
+			process.stderr.write("mochi is not running.\n");
+			return 1;
+		}
 		const config = await loadConfig(process.env);
-		if (config.executorUrl === undefined) throw new Error("Set executorUrl in config.toml (or EXECUTOR_URL) first.");
-		await mkdir(config.dataDir, { recursive: true });
-		await loginExecutor(config.executorUrl, authFile(config.dataDir), (line) => process.stdout.write(`${line}\n`));
-		return;
+		await mkdir(config.home.dir, { recursive: true });
+		if (cli.kind === "tui") setLogFile(config.home.logFile);
+		local = await startDaemon(config, cli.kind === "tui" ? "configured" : "terminal");
+		found = await reach(socket, watch);
+		if (found.kind !== "ready") throw new Error(found.reason);
 	}
-	const mode = parseMode(args, process.stdin.isTTY === true && process.stdout.isTTY === true);
-	const config = await loadConfig(process.env);
-	await mkdir(config.dataDir, { recursive: true });
-	const socket = socketPath(config.dataDir);
-
-	if (mode.kind === "daemon") {
-		const daemon = await startDaemon(config, "configured");
-		const reason = await new Promise<string>((resolveStop) => {
-			for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => resolveStop(signal));
-		});
-		await daemon.stop(reason);
-		return;
-	}
-
-	// A terminal attaches to the running daemon. Without one, this process becomes the daemon for as long as the
-	// terminal runs: every channel for the TUI, only the terminal for chat and print.
-	let local: Awaited<ReturnType<typeof startDaemon>> | undefined;
-	let client: AttachClient;
+	const client = found.client;
+	if (local !== undefined) stopOnSignal(local, () => client.close());
 	try {
-		client = await AttachClient.connect(socket);
-	} catch {
-		if (mode.kind === "tui") setLogFile(join(config.dataDir, "mochi.log"));
-		local = await startDaemon(config, mode.kind === "tui" ? "configured" : "terminal");
-		client = await AttachClient.connect(socket);
-	}
-	try {
-		if (mode.kind === "tui") await runTui(client, config.dataDir);
-		else await runLines(client, mode.prompt, { json: mode.json, ...(mode.id === undefined ? {} : { id: mode.id }) });
+		if (cli.kind === "tui") await runTui(client, home.dir, cli.to);
+		else await runLines(client, cli.prompt, cli);
 	} finally {
 		client.close();
 		await local?.stop("terminal closed");
+	}
+	return 0;
+}
+
+type Daemon = Awaited<ReturnType<typeof startDaemon>>;
+
+/** Each process that owns a daemon, a terminal included, ends its terminal, stops the daemon and exits on SIGINT or SIGTERM. */
+function stopOnSignal(daemon: Daemon, endTerminal: () => void): void {
+	for (const signal of ["SIGINT", "SIGTERM"] as const) {
+		process.once(signal, () => {
+			endTerminal();
+			void daemon.stop(signal).then(() => process.exit(0));
+		});
+	}
+}
+
+async function installService(home: Home): Promise<void> {
+	if (process.platform !== "linux") throw new Error("service install writes a systemd user unit, which needs Linux. Run node src/main.ts --headless under your own supervisor.");
+	const unit = [
+		"[Unit]",
+		"Description=mochi",
+		"Wants=network-online.target",
+		"After=network-online.target",
+		"StartLimitIntervalSec=0",
+		"",
+		"[Service]",
+		"Type=simple",
+		`WorkingDirectory=${REPO}`,
+		`Environment=MOCHI_HOME=${home.dir}`,
+		`Environment=PATH=${process.env.PATH ?? "/usr/bin:/bin"}`,
+		`ExecStart=${process.execPath} src/main.ts --headless`,
+		"Restart=always",
+		"RestartSec=5",
+		"KillSignal=SIGTERM",
+		"TimeoutStopSec=60",
+		`StandardOutput=append:${home.logFile}`,
+		`StandardError=append:${home.logFile}`,
+		"UMask=0077",
+		"",
+		"[Install]",
+		"WantedBy=default.target",
+		"",
+	].join("\n");
+	const dir = join(homedir(), ".config", "systemd", "user");
+	await mkdir(dir, { recursive: true });
+	await mkdir(home.dir, { recursive: true });
+	await writeFile(join(dir, "mochi.service"), unit);
+	process.stdout.write(`Wrote ${join(dir, "mochi.service")}. Start it: systemctl --user daemon-reload && systemctl --user enable --now mochi\n`);
+}
+
+/** Each config name for a model (brain, fast, strongest, classifier, aliases) and the model it picks. */
+function modelRoles(config: Config): Record<string, ModelRef> {
+	const { modelSetup } = config;
+	const roles: Record<string, ModelRef> = { brain: modelSetup.brain, fast: modelSetup.fast, strongest: modelSetup.ref("strongest") };
+	if (modelSetup.classifier !== undefined) roles.classifier = modelSetup.classifier;
+	for (const alias of Object.keys(config.file.models?.aliases ?? {})) roles[alias] = modelSetup.ref(alias);
+	return roles;
+}
+
+/** The git short hash of this checkout, with "+dirty" for uncommitted changes. */
+function buildOf(): string {
+	try {
+		const hash = execFileSync("git", ["-C", REPO, "rev-parse", "--short", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+		const dirty = execFileSync("git", ["-C", REPO, "status", "--porcelain", "--untracked-files=no"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() !== "";
+		return dirty ? `${hash}+dirty` : hash;
+	} catch {
+		return "unknown";
 	}
 }
 
 /** Open storage, the Harness, channels, components and the attach socket. `terminal` runs no outside channel. */
 async function startDaemon(config: Config, channelSet: "configured" | "terminal"): Promise<{ stop(reason: string): Promise<void> }> {
-	const releaseLock = acquireLock(join(config.dataDir, "mochi.lock"));
+	const releaseLock = acquireLock(join(config.home.dir, "mochi.lock"));
 	const controller = new AbortController();
 	const running = withAbortSignal(controller.signal, BACKGROUND_CONTEXT);
-	const index = new SearchIndex(join(config.dataDir, "index.sqlite"));
+	const index = new SearchIndex(join(config.home.dir, "index.sqlite"));
 
 	const { channels, report: channelReport } = channelSet === "terminal" ? { channels: new Map() as Channels, report: [] } : configuredChannels(config.env, config.users);
-	const workDir = join(config.dataDir, "work");
+	const workDir = join(config.home.dir, "work");
 	await mkdir(workDir, { recursive: true });
 	const a2a = a2aServerSetup(config.env);
-	for (const line of [...setupReport([...services(config), ["a2a", a2a]]), ...channelReport]) log("setup", { line });
+	const setup = [...setupReport([...services(config), ["a2a", a2a]]), ...channelReport];
+	for (const line of setup) log("setup", { line });
 	const { models } = config.modelSetup;
-	const apps = config.executorUrl === undefined ? undefined : connectApps(storedTokenConnector(config.executorUrl, authFile(config.dataDir)), log);
+	const profiles = new Profiles(config.home.profilesDir, join(REPO, "agents"), config.modelSetup.ref);
+	const apps = config.appsUrl === undefined ? undefined : connectApps(storedTokenConnector(config.appsUrl, authFile(config.home.dir)), log);
 
 	const mochi = await openMochi(
 		{
-			storage: await openNodeSqliteStorage(join(config.dataDir, "mochi.sqlite")),
+			storage: await openNodeSqliteStorage(join(config.home.dir, "mochi.sqlite")),
 			models,
 			brain: config.modelSetup.brain,
 			fast: config.modelSetup.fast,
-			classify: createClassify(models),
-			firecrawlKey: config.firecrawlKey,
-			...(config.env.FIRECRAWL_PROFILE?.trim() ? { firecrawlProfile: config.env.FIRECRAWL_PROFILE.trim() } : {}),
-			...(config.file.media === undefined ? {} : { media: { config: config.file.media, env: config.env } }),
-			...(config.file.idleResetMinutes === undefined ? {} : { idleResetMinutes: config.file.idleResetMinutes }),
+			classify: createClassify(models, config.modelSetup.classifier),
+			web: config.web,
+			...(config.file.media === undefined ? {} : { media: { config: config.file.media, env: config.env, ...(config.file.providers === undefined ? {} : { providers: config.file.providers }) } }),
 			...(apps === undefined ? {} : { apps }),
-			memory: { repo: resolve(config.file.memory?.repo ?? join(config.dataDir, "memory")), ...(config.file.memory?.dreaming === undefined ? {} : { dreaming: config.file.memory.dreaming }) },
 			index,
 			skillsDir: join(REPO, "skills"),
-			agents: await AgentCatalog.load(join(REPO, "agents"), config.home.agentsDir, config.modelSetup.ref),
+			profiles,
 			workDir,
 			channels,
 			users: config.users,
 			a2aPeers: config.a2aPeers,
-			home: config.home,
 			timeZone: config.timeZone,
 			publicUrl: config.env.MOCHI_PUBLIC_URL,
 			scheduling: channelSet === "terminal" ? "local" : "daemon",
-			today: () => new Intl.DateTimeFormat("en-CA", { timeZone: config.timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date()),
 			log,
-			...(await readPersona(config.dataDir)),
+			...(await readInstructions(config.home)),
 		},
 		BACKGROUND_CONTEXT,
 	);
 	mochi.harness.resume();
-	await listenAttach(socketPath(config.dataDir), { line: mochi.line, models, log }, running);
+	const stopCompaction = watchCompaction(mochi.harness, models, config.modelSetup.compactAt, running, (error) => log("compaction.failed", { error: String(error) }));
+	const facts: DaemonFacts = {
+		startedAt: new Date(),
+		build: buildOf(),
+		home: config.home.dir,
+		scheduling: channelSet === "terminal" ? "local" : "daemon",
+		channels: [...channels.keys()],
+		setup,
+		roles: modelRoles(config),
+	};
+	await listenAttach(socketPath(config.home.dir), { line: mochi.line, models, log, profiles, users: config.users, facts }, running);
 
 	const background = [
-		runFeed(mochi.harness, index, running, (error) => log("index.failed", { error: String(error) })),
+		runFeed(mochi.harness, index, fastCompletion(models, config.modelSetup.fast), mochi.catalog, running, (error) => log("memory.failed", { error: String(error) })),
 		...(apps === undefined ? [] : [apps.run(running)]),
 		// A terminal-only daemon (chat, print) serves one script; triggers wait for the real daemon.
 		...(channelSet === "terminal" ? [] : [triggersComponent(mochi, config, running), a2aComponent(mochi, config, a2a, running)]),
@@ -204,62 +284,89 @@ async function startDaemon(config: Config, channelSet: "configured" | "terminal"
 	const channelsRunning = new AbortController();
 	const sink: InboundSink = async (message) => void (await ingest(mochi.line, message, running));
 	const inbound = [...channels.values()].map((channel) =>
-		channel.run(sink, channelsRunning.signal, async () => (await mochi.harness.snapshot(InboundCursorDoc, channel.profile.id, running))?.sequence ?? null).catch((error: unknown) => {
+		channel.run(sink, channelsRunning.signal).catch((error: unknown) => {
 			log("channel.failed", { channel: channel.profile.id, error: String(error) });
 		}),
 	);
 	log("mochi.started", { channels: [...channels.keys()], pid: process.pid });
 
+	let stopped: Promise<void> | undefined;
+	const stop = async (reason: string): Promise<void> => {
+		log("mochi.stopping", { reason });
+		stopCompaction();
+		controller.abort();
+		await Promise.allSettled(background);
+		await mochi.harness.close(BACKGROUND_CONTEXT);
+		channelsRunning.abort();
+		await Promise.allSettled(inbound);
+		index.close();
+		rmSync(socketPath(config.home.dir), { force: true });
+		releaseLock();
+	};
+	// The signal handler and the terminal's own exit can both ask; the daemon stops once.
 	return {
-		async stop(reason) {
-			log("mochi.stopping", { reason });
-			controller.abort();
-			await Promise.allSettled(background);
-			await mochi.harness.close(BACKGROUND_CONTEXT);
-			channelsRunning.abort();
-			await Promise.allSettled(inbound);
-			index.close();
-			rmSync(socketPath(config.dataDir), { force: true });
-			releaseLock();
+		stop(reason) {
+			stopped ??= stop(reason);
+			return stopped;
 		},
 	};
 }
 
-/** `data/persona.md`, root's own instructions; no file leaves root's as they are. */
-async function readPersona(dataDir: string): Promise<{ persona?: string }> {
-	const text = await readFile(join(dataDir, "persona.md"), "utf8").catch(() => undefined);
-	return text === undefined || text.trim() === "" ? {} : { persona: text.trim() };
+async function readInstructions(home: Home): Promise<{ instructions?: string }> {
+	const text = await readFile(home.instructionsFile, "utf8").catch(() => undefined);
+	return text === undefined || text.trim() === "" ? {} : { instructions: text.trim() };
 }
 
-/** `<dataDir>/mochi.sock`, or a short path in the temp directory when that exceeds the Unix socket limit. */
-function socketPath(dataDir: string): string {
-	const path = join(dataDir, "mochi.sock");
+/** `<home>/mochi.sock`, or a short path in the temp directory when that exceeds the Unix socket limit. */
+function socketPath(homeDir: string): string {
+	const path = join(homeDir, "mochi.sock");
 	if (Buffer.byteLength(path) <= 100) return path;
-	return join(tmpdir(), `mochi-${createHash("sha256").update(dataDir).digest("hex").slice(0, 16)}.sock`);
+	return join(tmpdir(), `mochi-${createHash("sha256").update(homeDir).digest("hex").slice(0, 16)}.sock`);
 }
 
-/** The outside services mochi calls. Models and the web need a key; without OpenRouter the trigger gates pass. */
-export function services(config: Pick<Config, "modelSetup" | "openRouterKey" | "firecrawlKey" | "dataDir" | "executorUrl">): readonly (readonly [string, Setup<void>])[] {
-	const key = (value: string | undefined, name: string) => (value === undefined ? broken(`${name} is not set. Fix: put it in ~/.mochi/.env`) : ready(undefined));
+/** The outside services mochi calls. Models and the web need a key; without a classifier, classify steps fail. */
+function services(config: Pick<Config, "modelSetup" | "web" | "home" | "appsUrl" | "file">): readonly (readonly [string, Setup<void>])[] {
 	const missing = config.modelSetup.missing;
+	const unknown = unknownKeys(config.file);
 	return [
 		["models", missing.length === 0 ? ready(undefined) : broken(`${missing.join("; ")}. Fix: put the key in ~/.mochi/.env`)],
-		["classifier", config.openRouterKey === undefined ? off : ready(undefined)],
-		["firecrawl", key(config.firecrawlKey, "FIRECRAWL_API_KEY")],
-		["executor", config.executorUrl === undefined ? off : existsSync(authFile(config.dataDir)) ? ready(undefined) : broken(`not logged in. Fix: ${AUTH_COMMAND}`)],
+		["classifier", config.modelSetup.classifier === undefined ? off : ready(undefined)],
+		["config", unknown.length === 0 ? ready(undefined) : broken(`config.toml has keys mochi does not read: ${unknown.join(", ")}. They are ignored; remove them.`)],
+		["web", config.web.key === undefined ? broken(`${config.web.keyEnv} is not set. Fix: put it in ~/.mochi/.env`) : ready(undefined)],
+		["apps", config.appsUrl === undefined ? off : existsSync(authFile(config.home.dir)) ? ready(undefined) : broken(`not logged in. Fix: ${AUTH_COMMAND}`)],
 	];
 }
 
-/** Every ready adapter, and one readiness line per adapter. */
-export function configuredChannels(env: Env, users: readonly ChatUser[] = []): { readonly channels: Channels; readonly report: readonly string[] } {
+function configuredChannels(env: Env, users: readonly ChatUser[]): { readonly channels: Channels; readonly report: readonly string[] } {
 	const setups = (Object.keys(ADAPTERS) as ChatChannelId[]).map((id) => [id, ADAPTERS[id](env, users)] as const);
 	const channels = new Map(setups.flatMap(([id, setup]) => (setup.kind === "ready" ? [[id, setup.value] as const] : [])));
 	return { channels, report: setupReport(setups) };
 }
 
-if (import.meta.main) {
-	main(process.argv.slice(2)).catch((error: unknown) => {
-		log("mochi.crashed", { error: error instanceof Error ? (error.stack ?? error.message) : String(error) });
+async function run(args: readonly string[]): Promise<void> {
+	let cli: Cli;
+	try {
+		cli = parseCli(args, process.stdin.isTTY === true && process.stdout.isTTY === true);
+	} catch (error) {
+		process.stderr.write(`mochi: ${error instanceof Error ? error.message : String(error)}\n`);
+		process.exitCode = 2;
+		return;
+	}
+	try {
+		process.exitCode = await main(cli);
+	} catch (error) {
+		// Only a daemon logs a crash; a client command prints one line.
+		if (cli.kind === "daemon") log("mochi.crashed", { error: error instanceof Error ? (error.stack ?? error.message) : String(error) });
+		else process.stderr.write(`mochi: ${error instanceof Error ? error.message : String(error)}\n`);
 		process.exit(1);
+	}
+}
+
+if (import.meta.main) {
+	// A reader such as head can close stdout early. That ends the output, not the command.
+	process.stdout.on("error", (error: NodeJS.ErrnoException) => {
+		if (error.code === "EPIPE") process.exit(process.exitCode ?? 0);
+		throw error;
 	});
+	await run(process.argv.slice(2));
 }

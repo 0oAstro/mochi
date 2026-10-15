@@ -32,13 +32,8 @@ import {
 	VStack,
 } from "@earendil-works/pi-tui";
 import type { AttachClient } from "./client.ts";
-import type { ModelSummary } from "./protocol.ts";
+import type { AgentSummary, ModelSummary, Target } from "./protocol.ts";
 import { toolRenderers } from "./renderers.ts";
-
-// The terminal UI, ported from pi's experimental durable TUI (coding-agent/src/experimental/durable/tui.ts). It renders
-// the daemon's conversation view and task graph as they arrive over the attach socket. pi-coding-agent exports its
-// message components but not its editor keymap, status indicator, theme controller or tool renderers, so mochi keeps
-// its own key table, a plain status line and the default theme; tool cards take renderers from ./renderers.ts.
 
 type Action = "abort" | "exit" | "model" | "thinking" | "expand" | "followUp";
 
@@ -53,7 +48,6 @@ const KEYS: readonly (readonly [KeyId, Action])[] = [
 ];
 const THINKING = ["off", "low", "medium", "high", "xhigh", "max"] as const;
 
-/** Every slash command, in the order autocomplete lists them. Anything else starting with `/word` is refused, not sent. */
 const COMMANDS = [
 	{ name: "model", description: "Select model", argumentHint: "<provider/model>" },
 	{ name: "thinking", description: "Set thinking level", argumentHint: "<level>" },
@@ -68,7 +62,6 @@ type Command = (typeof COMMANDS)[number]["name"];
 const dim = (text: string) => styleText("dim", text);
 const accent = (text: string) => styleText("cyan", text);
 
-/** An editor that hands mochi's keys to `onAction` before editing. */
 class MochiEditor extends Editor {
 	onAction: (action: Action) => void = () => {};
 
@@ -79,7 +72,6 @@ class MochiEditor extends Editor {
 	}
 }
 
-/** A filterable list in place of the editor. */
 class ListSelector extends Container implements Focusable {
 	readonly #input = new Input();
 	readonly #listContainer = new Container();
@@ -188,7 +180,6 @@ class MochiTui {
 		this.ui.setFocus(this.editor);
 	}
 
-	/** Puts `component` in the editor's place; `mount(this.editor)` restores it. */
 	mount(component: Component & Focusable = this.editor): void {
 		this.#editorSlot.clear();
 		this.#editorSlot.addChild(component);
@@ -364,20 +355,21 @@ class MochiTui {
 
 interface Snapshot {
 	readonly client: AttachClient;
-	readonly conversations: readonly { readonly id: number; readonly label: string; readonly title?: string }[];
+	readonly conversations: readonly AgentSummary[];
 	readonly models: readonly ModelSummary[];
 	readonly usage: UsageState | undefined;
 	readonly activity: boolean;
 	readonly notices: readonly { readonly text: string; readonly error: boolean }[];
 }
 
-/** Runs until the owner exits. Work in flight keeps running in the daemon. */
-export async function runTui(client: AttachClient, cwd: string): Promise<void> {
+/** `target`: the conversation to open; absent, main. */
+export async function runTui(client: AttachClient, cwd: string, target?: Target): Promise<void> {
+	if (target !== undefined) await client.request({ op: "show", to: target });
 	initTheme();
 	const tui = new MochiTui(cwd);
 	let state: Snapshot = {
 		client,
-		conversations: await client.request({ op: "conversations" }),
+		conversations: await client.request({ op: "agents" }),
 		models: await client.request({ op: "models" }),
 		usage: await client.request({ op: "usage" }),
 		activity: true,
@@ -391,7 +383,6 @@ export async function runTui(client: AttachClient, cwd: string): Promise<void> {
 	const fail = (error: unknown) => update({ notices: [...state.notices, { text: error instanceof Error ? error.message : String(error), error: true }].slice(-20) });
 	const info = (text: string) => update({ notices: [...state.notices, { text, error: false }].slice(-20) });
 	const shown = () => state.client.view?.conversation.id ?? 0;
-	const agent = () => (state.client.view?.docs["pi.agent"] ?? {}) as AgentState;
 
 	let tasksSeen: TaskGraph | undefined;
 	let refreshing = false;
@@ -400,7 +391,7 @@ export async function runTui(client: AttachClient, cwd: string): Promise<void> {
 		if (client.tasks === tasksSeen || refreshing) return;
 		tasksSeen = client.tasks;
 		refreshing = true;
-		void Promise.all([client.request({ op: "usage" }), client.request({ op: "conversations" })])
+		void Promise.all([client.request({ op: "usage" }), client.request({ op: "agents" })])
 			.then(([usage, conversations]) => update({ usage, conversations }))
 			.catch(fail)
 			.finally(() => {
@@ -421,14 +412,14 @@ export async function runTui(client: AttachClient, cwd: string): Promise<void> {
 			state.models.map((model) => ({ value: `${model.provider}/${model.modelId}`, label: model.modelId, description: model.provider })),
 			(value) => {
 				const slash = value.indexOf("/");
-				void client.request({ op: "configure", conversationId: shown(), model: { provider: value.slice(0, slash), modelId: value.slice(slash + 1) } }).catch(fail);
+				void client.request({ op: "configure", to: shown(), model: { provider: value.slice(0, slash), modelId: value.slice(slash + 1) } }).catch(fail);
 			},
 		);
 	const selectConversation = () =>
 		select(
 			"Switch to:",
 			[...state.conversations].reverse().map((summary) => ({ value: String(summary.id), label: summary.label, description: summary.title ?? "" })),
-			(value) => void client.request({ op: "show", conversationId: Number(value) }).catch(fail),
+			(value) => void client.request({ op: "show", to: Number(value) }).catch(fail),
 		);
 
 	let exit = () => {};
@@ -437,7 +428,7 @@ export async function runTui(client: AttachClient, cwd: string): Promise<void> {
 	});
 	const setThinking = (level: string) => {
 		if (!(THINKING as readonly string[]).includes(level)) return fail(`Unknown thinking level ${level}. Use one of: ${THINKING.join(", ")}.`);
-		void client.request({ op: "configure", conversationId: shown(), thinkingLevel: level }).then(() => info(`Thinking: ${level}.`), fail);
+		void client.request({ op: "configure", to: shown(), thinkingLevel: level }).then(() => info(`Thinking: ${level}.`), fail);
 	};
 	const runCommand = (name: string, arg: string): void => {
 		if (!COMMANDS.some((command) => command.name === name)) return fail(`Unknown command /${name}. Type / to see the commands.`);
@@ -446,17 +437,17 @@ export async function runTui(client: AttachClient, cwd: string): Promise<void> {
 				if (arg === "") return selectModel();
 				const model = state.models.find((candidate) => `${candidate.provider}/${candidate.modelId}` === arg || candidate.modelId === arg);
 				if (model === undefined) return fail(`Unknown model ${arg}. Use /model to pick one.`);
-				void client.request({ op: "configure", conversationId: shown(), model: { provider: model.provider, modelId: model.modelId } }).catch(fail);
+				void client.request({ op: "configure", to: shown(), model: { provider: model.provider, modelId: model.modelId } }).catch(fail);
 				return;
 			}
 			case "thinking":
 				return arg === "" ? select("Thinking level:", THINKING.map((level) => ({ value: level, label: level })), setThinking) : setThinking(arg);
 			case "new":
-				void client.request({ op: "reset", conversationId: shown() }).then(() => info("New context started."), fail);
+				void client.request({ op: "reset", to: shown() }).then(() => info("New context started."), fail);
 				return;
 			case "compact":
 				void client
-					.request({ op: "compact", conversationId: shown(), ...(arg === "" ? {} : { instructions: arg }) })
+					.request({ op: "compact", to: shown(), ...(arg === "" ? {} : { instructions: arg }) })
 					.then(() => info("Compaction started."), fail);
 				return;
 			case "agents":
@@ -464,7 +455,7 @@ export async function runTui(client: AttachClient, cwd: string): Promise<void> {
 			case "tasks":
 				return update({ activity: !state.activity });
 			case "stop":
-				void client.request({ op: "abort", conversationId: shown(), everything: true }).then(() => info("Stopped everything this conversation owns."), fail);
+				void client.request({ op: "abort", to: shown(), everything: true }).then(() => info("Stopped everything this conversation owns."), fail);
 				return;
 			case "quit":
 				return exit();
@@ -477,12 +468,12 @@ export async function runTui(client: AttachClient, cwd: string): Promise<void> {
 		tui.editor.setText("");
 		const slash = /^\/([a-z-]+)(?:\s+([\s\S]*))?$/.exec(text);
 		if (slash !== null) return runCommand(slash[1]!, slash[2]?.trim() ?? "");
-		void client.request({ op: "submit", conversationId: shown(), text, whenBusy: "steer" }).catch(fail);
+		void client.request({ op: "submit", to: shown(), text, whenBusy: "steer" }).catch(fail);
 	};
 	tui.editor.onAction = (action) => {
 		switch (action) {
 			case "abort":
-				void client.request({ op: "abort", conversationId: shown(), everything: false }).catch(fail);
+				void client.request({ op: "abort", to: shown(), everything: false }).catch(fail);
 				return;
 			case "exit":
 				exit();
@@ -491,9 +482,9 @@ export async function runTui(client: AttachClient, cwd: string): Promise<void> {
 				selectModel();
 				return;
 			case "thinking": {
-				const current = agent().thinkingLevel ?? "off";
+				const current = ((state.client.view?.docs["pi.agent"] ?? {}) as AgentState).thinkingLevel ?? "off";
 				const next = THINKING[(THINKING.indexOf(current as (typeof THINKING)[number]) + 1) % THINKING.length] ?? "off";
-				void client.request({ op: "configure", conversationId: shown(), thinkingLevel: next }).catch(fail);
+				void client.request({ op: "configure", to: shown(), thinkingLevel: next }).catch(fail);
 				return;
 			}
 			case "expand":
@@ -503,7 +494,7 @@ export async function runTui(client: AttachClient, cwd: string): Promise<void> {
 				const text = tui.editor.getText().trim();
 				if (text === "") return;
 				tui.editor.setText("");
-				void client.request({ op: "submit", conversationId: shown(), text, whenBusy: "followUp" }).catch(fail);
+				void client.request({ op: "submit", to: shown(), text, whenBusy: "followUp" }).catch(fail);
 				return;
 			}
 		}
@@ -558,7 +549,6 @@ function totalUsage(state: UsageState): { readonly input: number; readonly outpu
 	return { input: sum((usage) => usage.input), output: sum((usage) => usage.output), cacheRead: sum((usage) => usage.cacheRead), cost: sum((usage) => usage.cost.total) };
 }
 
-/** Context size from the newest successful answer after the newest compaction. */
 function contextTokens(entries: readonly EntryRecord[]): number | undefined {
 	const compacted = Math.max(0, ...entries.filter((entry) => entry.kind === "pi.compaction").map((entry) => entry.id));
 	for (const entry of [...entries].reverse()) {

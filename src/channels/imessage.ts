@@ -1,7 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Content } from "spectrum-ts";
-import { type Log, log as defaultLog } from "../log.ts";
-import { clip } from "../text.ts";
+import { log } from "../log.ts";
 import type { Setup } from "../setup.ts";
 import {
 	type Attachment,
@@ -14,8 +13,6 @@ import {
 	DeliveryError,
 	type Env,
 	type Inbound,
-	type Reaction,
-	REACTIONS,
 	type ReplyTarget,
 	SendRejected,
 	SendUnknown,
@@ -24,7 +21,7 @@ import {
 const TEXT_LIMIT = 4000;
 const REMEMBERED_MESSAGES = 200;
 
-export const IMESSAGE_PROFILE: ChannelProfile = {
+const IMESSAGE_PROFILE: ChannelProfile = {
 	id: "imessage",
 	style:
 		"imessage: plain text. Each blank-line-separated paragraph is its own bubble, so write one to three short ones. " +
@@ -32,20 +29,15 @@ export const IMESSAGE_PROFILE: ChannelProfile = {
 	maxBubbles: 3,
 	maxBubbleChars: 400,
 	paragraphsAreBubbles: true,
-	reactions: REACTIONS,
 	typingMaxMs: 90_000,
 };
 
-const TAPBACKS: Readonly<Record<Reaction, string>> = { love: "❤️", like: "👍", dislike: "👎", laugh: "😂", emphasize: "‼️", question: "❓" };
-const TAPBACK_TEXT_CHARS = 80;
-
-export interface ReactionHandle {
+interface ReactionHandle {
 	unsend(): Promise<void>;
 }
 
-export interface IMessageMessage {
+interface IMessageMessage {
 	readonly id: string;
-	readonly sequence?: number;
 	readonly direction: "inbound" | "outbound";
 	readonly sender: { readonly id: string } | undefined;
 	readonly timestamp: Date;
@@ -55,7 +47,7 @@ export interface IMessageMessage {
 	read?(): Promise<void>;
 }
 
-export interface IMessageSpace {
+interface IMessageSpace {
 	send(text: string): Promise<unknown>;
 	/** A threaded reply to `targetMessageId`; a plain send when the target cannot be found. */
 	sendReply(text: string, targetMessageId: string): Promise<unknown>;
@@ -66,36 +58,27 @@ export interface IMessageSpace {
 	getMessage(id: string): Promise<IMessageMessage | undefined>;
 }
 
-export interface IMessageApp {
+interface IMessageApp {
 	readonly messages: AsyncIterable<readonly [IMessageSpace, IMessageMessage]>;
-	/** Owner events after `since`, ending at catchup.complete. Absent when the stack cannot replay. */
-	catchUp?(since: number): AsyncIterable<readonly [IMessageSpace, IMessageMessage]>;
 	dm(handle: string): Promise<IMessageSpace>;
 	stop(): Promise<void>;
 }
 
-export const LINK = { tickMs: 30_000, silentProbeMs: 5 * 60_000, failedProbesToRebuild: 2, catchUpEveryMs: 10 * 60_000, rebuildDelayMs: 5_000 };
+const LINK = { tickMs: 30_000, silentProbeMs: 5 * 60_000, failedProbesToRebuild: 2, rebuildDelayMs: 5_000 };
 
-/** Silence alone never rebuilds, it only earns a probe; the periodic catch-up heals a stall that probes cannot see. */
-export function judge(health: { readonly lastSignalAt: number; readonly failedProbes: number; readonly ended: boolean }, now: number, config: typeof LINK): "none" | "probe" | "rebuild" {
-	if (health.ended || health.failedProbes >= config.failedProbesToRebuild) return "rebuild";
-	return now - health.lastSignalAt >= config.silentProbeMs ? "probe" : "none";
+/** Silence alone never rebuilds, it only earns a probe. */
+function judge(health: { readonly lastSignalAt: number; readonly failedProbes: number; readonly ended: boolean }, now: number): "none" | "probe" | "rebuild" {
+	if (health.ended || health.failedProbes >= LINK.failedProbesToRebuild) return "rebuild";
+	return now - health.lastSignalAt >= LINK.silentProbeMs ? "probe" : "none";
 }
 
-export interface IMessageDeps {
-	readonly connect?: (credentials: { readonly projectId: string; readonly projectSecret: string }) => Promise<IMessageApp>;
-	readonly link?: typeof LINK;
-	readonly log?: Log;
-	/** Normalized handles of the users who may write besides the owner. */
-	readonly users?: readonly string[];
-}
+type Credentials = { readonly projectId: string; readonly projectSecret: string };
+
 
 export function normalizeHandle(handle: string): string {
 	const trimmed = handle.trim().toLowerCase();
 	return trimmed.includes("@") ? trimmed : trimmed.replace(/[^\d+]/g, "");
 }
-
-const IMESSAGE_ENV = ["PHOTON_PROJECT_ID", "PHOTON_PROJECT_SECRET", "IMESSAGE_OWNER"] as const;
 
 interface Collected {
 	readonly text: string[];
@@ -157,17 +140,15 @@ async function collect(content: Content, into: Collected): Promise<void> {
 
 type ParsedIMessage = { readonly kind: "message"; readonly message: Inbound } | { readonly kind: "ignored"; readonly reason: "outbound" | "not-owner" | "empty" };
 
-export async function toInbound(message: IMessageMessage, owner: string, users: readonly string[] = []): Promise<ParsedIMessage> {
+async function toInbound(message: IMessageMessage, owner: string, users: readonly string[]): Promise<ParsedIMessage> {
 	if (message.direction === "outbound") return { kind: "ignored", reason: "outbound" };
 	const sender = message.sender?.id === undefined ? "" : normalizeHandle(message.sender.id);
-	const isUser = sender !== "" && sender !== owner && users.includes(sender);
-	if (sender === "" || (sender !== owner && !isUser)) return { kind: "ignored", reason: "not-owner" };
-	const person = isUser ? { person: sender } : {};
-	const sequence = message.sequence === undefined ? {} : { sequence: message.sequence };
+	if (sender === "" || (sender !== owner && !users.includes(sender))) return { kind: "ignored", reason: "not-owner" };
+	const person = sender === owner ? {} : { person: sender };
 	const content = message.content;
 	if (content.type === "reaction") {
 		const target = content.target;
-		const onText = clip(contentText(target.content), TAPBACK_TEXT_CHARS);
+		const onText = contentText(target.content);
 		return {
 			kind: "message",
 			message: { kind: "tapback", channel: "imessage", messageId: message.id, on: target.id, emoji: content.emoji, onText, fromAgent: target.direction === "outbound", at: message.timestamp, ...person },
@@ -179,7 +160,7 @@ export async function toInbound(message: IMessageMessage, owner: string, users: 
 	const replyTo = collected.replyTo === undefined ? {} : { replyTo: collected.replyTo };
 	return {
 		kind: "message",
-		message: { kind: "message", channel: "imessage", messageId: message.id, text: collected.text.join("\n"), at: message.timestamp, attachments: collected.attachments, ...sequence, ...person, ...replyTo },
+		message: { kind: "message", channel: "imessage", messageId: message.id, text: collected.text.join("\n"), at: message.timestamp, attachments: collected.attachments, ...person, ...replyTo },
 	};
 }
 
@@ -199,14 +180,14 @@ const GRPC_CLASS: Readonly<Record<number, new (message: string, options: ErrorOp
 	9: SendRejected,
 };
 
-export function classifyIMessageError(error: unknown): DeliveryError {
+function classifyIMessageError(error: unknown): DeliveryError {
 	if (error instanceof DeliveryError) return error;
 	const code = typeof error === "object" && error !== null && "grpcCode" in error && typeof error.grpcCode === "number" ? error.grpcCode : undefined;
 	const Class = (code === undefined ? undefined : GRPC_CLASS[code]) ?? SendUnknown;
 	return new Class(`iMessage send failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 }
 
-async function connectPhoton(credentials: { readonly projectId: string; readonly projectSecret: string }): Promise<IMessageApp> {
+async function connectPhoton(credentials: Credentials): Promise<IMessageApp> {
 	const { Spectrum, attachment, reply, richlink } = await import("spectrum-ts");
 	const { imessage } = await import("spectrum-ts/providers/imessage");
 	// @ts-expect-error spectrum-ts 12.10.1 provider types do not resolve under exactOptionalPropertyTypes; runtime accepts an empty config.
@@ -234,18 +215,15 @@ async function connectPhoton(credentials: { readonly projectId: string; readonly
 	};
 }
 
-export function createIMessageChannel(env: Env, deps: IMessageDeps = {}): Setup<Channel> {
-	return channelSetup(env, IMESSAGE_ENV, (values) => {
+/** `users`: normalized handles of the users who may write besides the owner. */
+export function createIMessageChannel(env: Env, users: readonly string[]): Setup<Channel> {
+	return channelSetup(env, ["PHOTON_PROJECT_ID", "PHOTON_PROJECT_SECRET", "IMESSAGE_OWNER"], (values) => {
 		const credentials = { projectId: values.PHOTON_PROJECT_ID, projectSecret: values.PHOTON_PROJECT_SECRET };
-		return iMessageChannel(credentials, normalizeHandle(values.IMESSAGE_OWNER), deps);
+		return iMessageChannel(credentials, normalizeHandle(values.IMESSAGE_OWNER), users);
 	});
 }
 
-function iMessageChannel(credentials: { readonly projectId: string; readonly projectSecret: string }, owner: string, deps: IMessageDeps): Channel {
-	const connect = deps.connect ?? connectPhoton;
-	const log = deps.log ?? defaultLog;
-	const link = deps.link ?? LINK;
-	const users = deps.users ?? [];
+function iMessageChannel(credentials: Credentials, owner: string, users: readonly string[]): Channel {
 	let app: IMessageApp | undefined;
 	const spaces = new Map<string, IMessageSpace>();
 	const recent = new Map<string, IMessageMessage>();
@@ -269,7 +247,7 @@ function iMessageChannel(credentials: { readonly projectId: string; readonly pro
 	return {
 		profile: IMESSAGE_PROFILE,
 
-		async run(sink, signal, cursor = async () => null) {
+		async run(sink, signal) {
 			const handle = async (from: IMessageSpace, message: IMessageMessage) => {
 				try {
 					const parsed = await toInbound(message, owner, users);
@@ -287,16 +265,10 @@ function iMessageChannel(credentials: { readonly projectId: string; readonly pro
 					log("channel.handler_failed", { channel: "imessage", error: String(error) });
 				}
 			};
-			const catchUp = (connected: IMessageApp) =>
-				(async () => {
-					const since = await cursor();
-					if (since !== null && connected.catchUp) for await (const [from, message] of connected.catchUp(since)) await handle(from, message);
-				})().catch((error: unknown) => log("channel.catch_up_failed", { channel: "imessage", error: String(error) }));
 			const supervise = async (connected: IMessageApp) => {
 				app = connected;
 				const health = { lastSignalAt: Date.now(), failedProbes: 0, ended: false };
 				void (async () => {
-					await catchUp(connected);
 					for await (const [from, message] of connected.messages) {
 						health.lastSignalAt = Date.now();
 						await handle(from, message);
@@ -304,9 +276,9 @@ function iMessageChannel(credentials: { readonly projectId: string; readonly pro
 				})()
 					.catch((error: unknown) => log("channel.stream_failed", { channel: "imessage", error: String(error) }))
 					.finally(() => (health.ended = true));
-				for (let caughtUpAt = Date.now(); !signal.aborted; ) {
-					await sleep(link.tickMs, undefined, { signal }).catch(() => {});
-					const action = signal.aborted ? "none" : judge(health, Date.now(), link);
+				while (!signal.aborted) {
+					await sleep(LINK.tickMs, undefined, { signal }).catch(() => {});
+					const action = signal.aborted ? "none" : judge(health, Date.now());
 					if (action === "rebuild") return health.ended ? "stream ended" : "probes failed";
 					if (action === "probe") {
 						// Photon refuses the made-up id with a gRPC refusal (INVALID_ARGUMENT); any answer from the server proves the link.
@@ -318,14 +290,11 @@ function iMessageChannel(credentials: { readonly projectId: string; readonly pro
 							);
 						Object.assign(health, alive ? { lastSignalAt: Date.now(), failedProbes: 0 } : { failedProbes: health.failedProbes + 1 });
 					}
-					if (Date.now() - caughtUpAt < link.catchUpEveryMs) continue;
-					await catchUp(connected);
-					caughtUpAt = Date.now();
 				}
 				return "stopped";
 			};
 			for (let failures = 0; !signal.aborted; ) {
-				const connected = await connect(credentials).catch((error: unknown) => void log("channel.connect_failed", { channel: "imessage", error: String(error) }));
+				const connected = await connectPhoton(credentials).catch((error: unknown) => void log("channel.connect_failed", { channel: "imessage", error: String(error) }));
 				failures = connected ? 0 : failures + 1;
 				const reason =
 					connected &&
@@ -335,7 +304,7 @@ function iMessageChannel(credentials: { readonly projectId: string; readonly pro
 						return connected.stop();
 					}));
 				if (reason && !signal.aborted) log("imessage.rebuilt", { reason });
-				await sleep(Math.min(link.rebuildDelayMs * 2 ** failures, 5 * 60_000), undefined, { signal }).catch(() => {});
+				await sleep(Math.min(LINK.rebuildDelayMs * 2 ** failures, 5 * 60_000), undefined, { signal }).catch(() => {});
 			}
 		},
 
@@ -371,7 +340,7 @@ function iMessageChannel(credentials: { readonly projectId: string; readonly pro
 			const target = recent.get(messageId) ?? (await (await space()).getMessage(messageId));
 			if (!target) throw new Error(`iMessage message ${messageId} not found`);
 			await previous?.unsend();
-			const handle = await target.react(TAPBACKS[reaction]);
+			const handle = await target.react(reaction);
 			if (handle) reactions.set(messageId, handle);
 			else reactions.delete(messageId);
 		},

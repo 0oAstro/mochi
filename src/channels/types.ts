@@ -1,32 +1,21 @@
 import { broken, off, ready, type Setup } from "../setup.ts";
 
-export type ChatChannelId = "imessage" | "telegram" | "whatsapp";
+export type ChatChannelId = "imessage" | "whatsapp";
 /** `cli` is a view, not a line: attached terminals render replies from the transcript, and nothing is delivered to it. */
 export type ChannelId = ChatChannelId | "cli";
 
-/**
- * What a platform can show and how mochi writes for it. The single source for `present()`, typing, tapbacks and the
- * `channels` prompt line.
- */
 export interface ChannelProfile {
 	readonly id: ChatChannelId;
-	/** One line for the `channels` section. Names the bubble rule, so the model and `present()` agree. */
 	readonly style: string;
-	/** A reply with more bubbles than this merges the rest into the last one. */
 	readonly maxBubbles: number;
-	/** A longer paragraph is split at a sentence end. */
 	readonly maxBubbleChars: number;
-	/** Blank-line-separated paragraphs become separate messages. */
 	readonly paragraphsAreBubbles: boolean;
-	/** Reactions this platform can show. Empty: the channel has no `react`. */
-	readonly reactions: readonly Reaction[];
 	/** The typing indicator stops after this long, so a long job is silent instead of "typing" for minutes. */
 	readonly typingMaxMs: number;
 }
 
-/** The six iMessage tapbacks, the common set every channel maps to its own reaction. */
-export const REACTIONS = ["love", "like", "dislike", "laugh", "emphasize", "question"] as const;
-export type Reaction = (typeof REACTIONS)[number];
+/** One emoji, as the model picks it: "👍", "😂", "🫡". */
+export type Reaction = string;
 
 export interface Attachment {
 	readonly kind: "image" | "audio" | "file";
@@ -38,7 +27,6 @@ export interface Attachment {
 export interface ReplyTarget {
 	readonly messageId: string;
 	readonly text: string;
-	/** Mochi sent the target. */
 	readonly fromAgent: boolean;
 }
 
@@ -51,11 +39,8 @@ export type Inbound =
 			readonly text: string;
 			readonly at: Date;
 			readonly attachments: readonly Attachment[];
-			/** The platform's durable event sequence, where it has one (iMessage). */
-			readonly sequence?: number;
 			/** A configured user's normalized handle. Absent: the owner wrote it. */
 			readonly person?: string;
-			/** Set when the message is a threaded reply. */
 			readonly replyTo?: ReplyTarget;
 	  }
 	/** The owner or a user reacted to a message. It becomes a passive transcript write, never a model turn. */
@@ -66,9 +51,7 @@ export type Inbound =
 			readonly messageId: string;
 			readonly on: string;
 			readonly emoji: string;
-			/** The reacted message's text, clipped; "" when unknown. */
 			readonly onText: string;
-			/** Mochi sent the reacted message. */
 			readonly fromAgent: boolean;
 			/** A configured user's normalized handle. Absent: the owner reacted. */
 			readonly person?: string;
@@ -83,7 +66,6 @@ export type Bubble =
 	| { readonly kind: "link"; readonly url: string }
 	| { readonly kind: "file"; readonly name: string; readonly mimeType: string; readonly bytes: Uint8Array };
 
-/** Why a send failed. Each adapter maps every platform error to exactly one subclass. */
 export class DeliveryError extends Error {}
 /** The bubble never left: reconnecting, service unreachable, or the channel is not running in this process. Retry. */
 export class ChannelDown extends DeliveryError {
@@ -100,12 +82,11 @@ export class SendRejected extends DeliveryError {
 
 export interface Channel {
 	readonly profile: ChannelProfile;
-	/** Runs until `signal` aborts, never messaging the owner about itself. `cursor` reads the sequence `ingest` stored, for replay. */
-	run(sink: InboundSink, signal: AbortSignal, cursor?: () => Promise<number | null>): Promise<void>;
+	/** Runs until `signal` aborts, never messaging the owner about itself. */
+	run(sink: InboundSink, signal: AbortSignal): Promise<void>;
 	/** Throws only DeliveryError subclasses for platform failures. `person` absent: the owner. */
 	send(bubble: Bubble, person?: string, options?: { readonly replyTo?: string }): Promise<void>;
 	typing(on: boolean, person?: string): Promise<void>;
-	/** Present only when `profile.reactions` is non-empty. `none` removes the reaction. */
 	react?(messageId: string, reaction: Reaction | "none"): Promise<void>;
 }
 

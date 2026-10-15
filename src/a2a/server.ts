@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Context } from "@earendil-works/chord";
 import { withCancel } from "@earendil-works/chord/context";
 import { AgentDoc, type ConversationId, defineDocFamily, type Harness, ROOT_CONVERSATION_ID, type SubmissionId, type Tx } from "@earendil-works/pi-durable";
 import { Value } from "typebox/value";
 import type { Config } from "../config.ts";
+import { holdText } from "../context.ts";
 import { readBody, safeEqual } from "../http.ts";
 import { type Log, log } from "../log.ts";
 import type { Mochi } from "../mochi.ts";
@@ -39,8 +40,7 @@ import {
 const BODY_LIMIT = 1024 * 1024;
 const CARD_PATHS = ["/.well-known/agent-card.json", "/.well-known/agent.json"];
 
-/** The conversation of one peer's A2A context, keyed `<peer>:<contextId>`. One writer: `ensureContext`. */
-export const A2AContextDoc = defineDocFamily<{ conversation: ConversationId | null }, null>({
+const A2AContextDoc = defineDocFamily<{ conversation: ConversationId | null }, null>({
 	kind: "mochi.a2a-context",
 	version: 1,
 	scope: "session",
@@ -48,10 +48,9 @@ export const A2AContextDoc = defineDocFamily<{ conversation: ConversationId | nu
 	initial: () => ({ conversation: null }),
 });
 
-export type A2ATask = { peer: string; contextId: string; conversation: ConversationId; submission: SubmissionId };
+type A2ATask = { peer: string; contextId: string; conversation: ConversationId; submission: SubmissionId };
 
-/** One A2A task, keyed by task id. One writer: `recordTask`. */
-export const A2ATaskDoc = defineDocFamily<{ task: A2ATask | null }, null>({
+const A2ATaskDoc = defineDocFamily<{ task: A2ATask | null }, null>({
 	kind: "mochi.a2a-task",
 	version: 1,
 	scope: "session",
@@ -59,8 +58,7 @@ export const A2ATaskDoc = defineDocFamily<{ task: A2ATask | null }, null>({
 	initial: () => ({ task: null }),
 });
 
-export interface A2AServerSettings {
-	/** Peer name to bearer token. */
+interface A2AServerSettings {
 	readonly tokens: ReadonlyMap<string, string>;
 	readonly host: string;
 	readonly port: number;
@@ -69,7 +67,6 @@ export interface A2AServerSettings {
 	readonly replyTimeoutMs: number;
 }
 
-/** The server settings from `MOCHI_A2A_*`. Without peer tokens the server stays off. */
 export function a2aServerSetup(env: Config["env"]): Setup<A2AServerSettings> {
 	const raw = env.MOCHI_A2A_PEER_TOKENS?.trim() ?? "";
 	if (raw === "") return broken("the server is off. Fix: set MOCHI_A2A_PEER_TOKENS=name:token,name2:token2");
@@ -98,36 +95,18 @@ export function a2aServerSetup(env: Config["env"]): Setup<A2AServerSettings> {
 	});
 }
 
-export function contextInstructions(peer: string): string {
-	return (
-		`This conversation is with ${peer}, another AI agent that works for the owner. Its messages are requests from that agent. ` +
-		"Do the work with your tools, then answer with the result as plain text. " +
-		"You cannot message the owner or other agents from here."
-	);
-}
-
-/** Inside a commit: the conversation of one peer's context, created on its first message. */
-export async function ensureContext(tx: Tx, peer: string, contextId: string): Promise<ConversationId> {
+async function ensureContext(tx: Tx, peer: string, contextId: string): Promise<ConversationId> {
 	const doc = await tx.doc(A2AContextDoc, `${peer}:${contextId}`, null);
 	if (doc.conversation === null) {
-		// The persona is root's instructions; a profile answers its peers in its own voice.
-		const persona = (await tx.doc(AgentDoc, ROOT_CONVERSATION_ID)).instructions;
-		const instructions = persona === undefined || persona === "" ? contextInstructions(peer) : `${persona}\n\n${contextInstructions(peer)}`;
-		doc.conversation = await createSeatConversation(tx, "worker", { kind: "ownerless" }, { instructions });
+		const peerInstructions =
+			`This conversation is with ${peer}, another AI agent that works for the owner. Its messages are requests from that agent. ` +
+			"Do the work with your tools, then answer with the result as plain text. " +
+			"You cannot message the owner or other agents from here.";
+		const own = (await tx.doc(AgentDoc, ROOT_CONVERSATION_ID)).instructions;
+		const instructions = own === undefined || own === "" ? peerInstructions : `${own}\n\n${peerInstructions}`;
+		doc.conversation = await createSeatConversation(tx, "peer", { kind: "ownerless" }, { instructions });
 	}
 	return doc.conversation;
-}
-
-/** Inside a commit: the task of a submission. A redelivered message finds its task already there. */
-export async function recordTask(tx: Tx, taskId: string, task: A2ATask): Promise<void> {
-	const doc = await tx.doc(A2ATaskDoc, taskId, null);
-	if (doc.task === null) doc.task = task;
-}
-
-export const taskIdOf = (submission: SubmissionId): string => `a2a-${submission}`;
-
-export function contextTag(peer: string, at: Date, timeZone: string, contextId: string, messageId: string): string {
-	return `[a2a ${peer} ${formatStamp(at, timeZone)} context=${contextId} id=${messageId}]`;
 }
 
 interface ServerDeps {
@@ -135,10 +114,10 @@ interface ServerDeps {
 	readonly settings: A2AServerSettings;
 	readonly timeZone: string;
 	readonly log: Log;
+	readonly workDir: string;
 }
 
-/** Serves the agent card and JSON-RPC on `POST /` until `context` aborts. Resolves with the bound address once listening. */
-export async function startA2AServer(deps: ServerDeps, context: Context): Promise<{ readonly server: Server; readonly address: AddressInfo }> {
+async function startA2AServer(deps: ServerDeps, context: Context): Promise<AddressInfo> {
 	const server = createServer((request, response) => {
 		handle(deps, request, response, context).catch((error: unknown) => {
 			deps.log("a2a.failed", { url: request.url, error: String(error) });
@@ -150,10 +129,9 @@ export async function startA2AServer(deps: ServerDeps, context: Context): Promis
 		server.listen(deps.settings.port, deps.settings.host, () => resolve());
 	});
 	context.abortSignal?.addEventListener("abort", () => server.close(), { once: true });
-	return { server, address: server.address() as AddressInfo };
+	return server.address() as AddressInfo;
 }
 
-/** The peer whose token the request carries, or undefined. */
 function peerOf(tokens: ReadonlyMap<string, string>, header: string | undefined): string | undefined {
 	if (header === undefined || !header.startsWith("Bearer ")) return undefined;
 	const given = header.slice(7).trim();
@@ -168,8 +146,7 @@ async function handle(deps: ServerDeps, request: IncomingMessage, response: Serv
 	const { settings } = deps;
 	const path = new URL(request.url ?? "/", "http://a2a").pathname;
 	if (request.method === "GET" && CARD_PATHS.includes(path)) {
-		const card = agentCard({ name: settings.agentName, description: "The owner's personal agent, mochi. Ask it to do work with the owner's tools.", url: settings.publicUrl });
-		return sendJson(response, 200, card);
+		return sendJson(response, 200, agentCard(settings.agentName, "The owner's personal agent, mochi. Ask it to do work with the owner's tools.", settings.publicUrl));
 	}
 	const peer = peerOf(settings.tokens, request.headers.authorization);
 	if (peer === undefined) {
@@ -209,11 +186,16 @@ async function sendMessage(deps: ServerDeps, peer: string, id: RpcId, params: un
 	const contextId = message.contextId ?? params.contextId ?? randomUUID();
 	const conversationId = await harness.commit((tx) => ensureContext(tx, peer, contextId), context);
 	const conversation = (await harness.conversation(conversationId, context))!;
-	const content = `${contextTag(peer, new Date(), deps.timeZone, contextId, message.messageId)}\n${text}`;
-	const submission = await conversation.submit({ type: "input", content, requestId: `a2a:${peer}:${message.messageId}`, whenBusy: "followUp" }, context);
-	const taskId = taskIdOf(submission.id);
+	const requestId = `a2a:${peer}:${message.messageId}`;
+	const held = await holdText(harness, deps.workDir, conversationId, `in:${requestId}`, text, context);
+	const content = `[a2a ${peer} ${formatStamp(new Date(), deps.timeZone)} context=${contextId} id=${message.messageId}]\n${held}`;
+	const submission = await conversation.submit({ type: "input", content, requestId, whenBusy: "followUp" }, context);
+	const taskId = `a2a-${submission.id}`;
 	const task: A2ATask = { peer, contextId, conversation: conversationId, submission: submission.id };
-	await harness.commit((tx) => recordTask(tx, taskId, task), context);
+	await harness.commit(async (tx) => {
+		const doc = await tx.doc(A2ATaskDoc, taskId, null);
+		if (doc.task === null) doc.task = task;
+	}, context);
 	deps.log("a2a.received", { peer, contextId, messageId: message.messageId, taskId });
 
 	const returnImmediately = configuration?.returnImmediately === true || configuration?.blocking === false;
@@ -235,7 +217,6 @@ async function getTask(deps: ServerDeps, peer: string, id: RpcId, params: unknow
 	return rpcResult(id, taskJson(await taskView(deps.harness, taskId, task, context)));
 }
 
-/** The task's state, read from its submission: queued or placed is working, done is completed, unanswered is failed. */
 async function taskView(harness: Harness, taskId: string, task: A2ATask, context: Context): Promise<TaskView> {
 	const submission = await harness.submission(task.submission, context);
 	if (submission === undefined) return { id: taskId, contextId: task.contextId, state: TASK_FAILED, text: "the submission is gone" };
@@ -254,9 +235,8 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
 	response.end(JSON.stringify(value));
 }
 
-/** The daemon's A2A component: serve peers until `context` aborts. Off without peer tokens. */
-export async function a2aComponent({ harness }: Mochi, config: Config, setup: Setup<A2AServerSettings>, context: Context): Promise<void> {
+export async function a2aComponent({ harness, line }: Mochi, config: Config, setup: Setup<A2AServerSettings>, context: Context): Promise<void> {
 	if (setup.kind !== "ready") return;
-	const { address } = await startA2AServer({ harness, settings: setup.value, timeZone: config.timeZone, log }, context);
+	const address = await startA2AServer({ harness, settings: setup.value, timeZone: config.timeZone, log, workDir: line.workDir }, context);
 	log("a2a.started", { peers: [...setup.value.tokens.keys()], listen: `${address.address}:${address.port}` });
 }

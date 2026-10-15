@@ -1,21 +1,20 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile, unlink } from "node:fs/promises";
-import { setTimeout as delay } from "node:timers/promises";
 import { basename } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { Type } from "@earendil-works/pi-ai";
+import { providerEndpoint, type ProviderConfig } from "../brain/providers.ts";
 import { parseWith } from "../parse.ts";
-import { mimeOf, outputPath, saveOutput, workPath } from "./files.ts";
+import { loadAttachment, mimeOf, outputPath, saveOutput, workPath } from "./files.ts";
 import { parseMediaConfig, type MediaConfig, type ImageProvider } from "./providers.ts";
 
 export interface MediaDeps {
 	readonly workDir: string;
 	readonly config: MediaConfig;
 	readonly env: Readonly<Record<string, string | undefined>>;
-	readonly fetch?: typeof fetch;
-	readonly deepgramEndpoint?: string;
-	readonly pollMs?: number;
-	readonly videoTimeoutMs?: number;
+	/** The `[providers]` table, where `media.speech.provider` finds its url and key. */
+	readonly providers?: Readonly<Record<string, ProviderConfig>>;
 }
 
 const ImageReply = Type.Object({ data: Type.Array(Type.Union([
@@ -27,13 +26,9 @@ const VideoReply = Type.Object({
 	status: Type.Union(["queued", "in_progress", "completed", "failed"].map((status) => Type.Literal(status))),
 	error: Type.Optional(Type.Union([Type.Null(), Type.Object({ message: Type.String() })])),
 });
-const TranscriptReply = Type.Object({
-	metadata: Type.Optional(Type.Object({ duration: Type.Optional(Type.Number()) })),
-	results: Type.Object({ channels: Type.Array(Type.Object({ alternatives: Type.Array(Type.Object({ transcript: Type.String() }), { minItems: 1 }) }), { minItems: 1 }) }),
-});
+const TranscriptReply = Type.Object({ text: Type.String(), duration: Type.Optional(Type.Number()) });
 
 const execute = promisify(execFile);
-export const DEFAULT_VOICE = "cordelia";
 
 export class MediaClient {
 	private readonly deps: MediaDeps;
@@ -59,7 +54,7 @@ export class MediaClient {
 
 	private async request(url: string, init: RequestInit, signal?: AbortSignal): Promise<Response> {
 		const timeout = AbortSignal.timeout(120_000);
-		const response = await (this.deps.fetch ?? fetch)(url, {
+		const response = await fetch(url, {
 			...init, signal: signal === undefined ? timeout : AbortSignal.any([signal, timeout]),
 		});
 		if (!response.ok) {
@@ -80,7 +75,7 @@ export class MediaClient {
 		let headers = route.headers;
 		if (args.edit !== undefined) {
 			if (!provider.edits) throw new Error(`Image provider ${provider.name} does not support edits.`);
-			const image = await loadImage(args.edit, this.deps.workDir);
+			const image = await loadAttachment(args.edit, this.deps.workDir);
 			const form = new FormData();
 			form.set("model", provider.model);
 			form.set("prompt", args.prompt);
@@ -94,8 +89,7 @@ export class MediaClient {
 		}
 		const response = await this.request(`${route.base}/images/${args.edit === undefined ? "generations" : "edits"}`, { method: "POST", headers, body }, signal);
 		const reply = parseWith(ImageReply, await response.json(), "image response");
-		const image = reply.data[0];
-		if (image === undefined) throw new Error("Image response is empty.");
+		const image = reply.data[0]!;
 		let bytes: Buffer;
 		if ("b64_json" in image) {
 			bytes = Buffer.from(image.b64_json, "base64");
@@ -104,8 +98,7 @@ export class MediaClient {
 			if (url.protocol !== "https:" || url.username || url.password) throw new Error("Image download URL must use HTTPS without credentials.");
 			bytes = Buffer.from(await (await this.request(url.href, {}, signal)).arrayBuffer());
 		}
-		const extension = imageExtension(bytes);
-		return saveOutput(this.deps.workDir, extension, bytes);
+		return saveOutput(this.deps.workDir, imageExtension(bytes), bytes);
 	}
 
 	async video(args: { prompt: string; seconds?: "4" | "8" | "12"; orientation?: "portrait" | "landscape" }, signal?: AbortSignal): Promise<{ path: string }> {
@@ -124,7 +117,7 @@ export class MediaClient {
 		const provider = this.deps.config.video;
 		if (!provider) throw new Error("No video provider configured.");
 		const route = this.route(provider);
-		const deadline = AbortSignal.timeout(this.deps.videoTimeoutMs ?? 8 * 60_000);
+		const deadline = AbortSignal.timeout(8 * 60_000);
 		const bounded = signal === undefined ? deadline : AbortSignal.any([signal, deadline]);
 		const url = `${route.base}/videos/${encodeURIComponent(id)}`;
 		try {
@@ -136,60 +129,53 @@ export class MediaClient {
 					const content = await this.request(`${url}/content?variant=video`, { headers: route.headers }, bounded);
 					return saveOutput(this.deps.workDir, "mp4", new Uint8Array(await content.arrayBuffer()));
 				}
-				await delay(this.deps.pollMs ?? 5_000, undefined, { signal: bounded });
+				await delay(5_000, undefined, { signal: bounded });
 			}
 		} catch (error) {
 			throw new Error(`Video ${id} was not downloaded. ${error instanceof Error ? error.message : String(error)} Resume with this id, do not generate it again.`, { cause: error });
 		}
 	}
 
-	private deepgram(): { base: string; headers: Record<string, string> } {
-		const keyEnv = this.deps.config.speech?.deepgramKeyEnv;
-		const key = keyEnv === undefined ? undefined : this.deps.env[keyEnv];
-		if (!key) throw new Error(`Deepgram is not configured: ${keyEnv ?? "speech.deepgramKeyEnv"} is unset.`);
-		return { base: (this.deps.deepgramEndpoint ?? "https://api.deepgram.com").replace(/\/$/, ""), headers: { Authorization: `Token ${key}` } };
+	private speech(): { base: string; headers: Record<string, string>; tts: string; stt: string; voice: string } {
+		const speech = this.deps.config.speech;
+		if (speech === undefined) throw new Error("Speech is not configured: set [media.speech] provider, tts and stt.");
+		const route = this.route(providerEndpoint(speech.provider, this.deps.providers));
+		return { ...route, tts: speech.tts, stt: speech.stt, voice: speech.voice ?? "coral" };
 	}
 
 	async speak(args: { text: string; voice?: string }, signal?: AbortSignal): Promise<{ path: string }> {
-		const voice = args.voice ?? DEFAULT_VOICE;
-		if (!/^[a-z]+$/.test(voice)) throw new Error("Voice must be an Aura-2 English voice name, such as cordelia.");
-		const route = this.deepgram();
-		const response = await this.request(`${route.base}/v1/speak?model=aura-2-${voice}-en&encoding=mp3`, {
-			method: "POST", headers: { ...route.headers, "content-type": "application/json" }, body: JSON.stringify({ text: args.text }),
+		const speech = this.speech();
+		const response = await this.request(`${speech.base}/audio/speech`, {
+			method: "POST", headers: { ...speech.headers, "content-type": "application/json" },
+			body: JSON.stringify({ model: speech.tts, input: args.text, voice: args.voice ?? speech.voice, response_format: "aac" }),
 		}, signal);
-		const mp3 = await saveOutput(this.deps.workDir, "mp3", new Uint8Array(await response.arrayBuffer()));
+		const aac = await saveOutput(this.deps.workDir, "aac", new Uint8Array(await response.arrayBuffer()));
+		const aacAbsolute = await workPath(aac.path, this.deps.workDir);
 		const m4a = await outputPath(this.deps.workDir, "m4a");
 		try {
-			await execute("ffmpeg", ["-nostdin", "-hide_banner", "-loglevel", "error", "-i", await workPath(mp3.path, this.deps.workDir), "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-n", m4a.absolute], { ...(signal === undefined ? {} : { signal }), timeout: 60_000 });
+			await execute("ffmpeg", ["-nostdin", "-hide_banner", "-loglevel", "error", "-i", aacAbsolute, "-c:a", "copy", "-movflags", "+faststart", "-n", m4a.absolute], { ...(signal === undefined ? {} : { signal }), timeout: 60_000 });
 			return { path: m4a.path };
 		} catch (error) {
 			await unlink(m4a.absolute).catch(() => {});
 			throw error;
 		} finally {
-			await unlink(await workPath(mp3.path, this.deps.workDir)).catch(() => {});
+			await unlink(aacAbsolute).catch(() => {});
 		}
 	}
 
 	async transcript(path: string, signal?: AbortSignal): Promise<{ text: string; duration?: number }> {
 		const absolute = await workPath(path, this.deps.workDir);
-		const route = this.deepgram();
-		const response = await this.request(`${route.base}/v1/listen?model=nova-3&smart_format=true&detect_language=true`, {
-			method: "POST", headers: { ...route.headers, "content-type": mimeOf(path) }, body: await readFile(absolute),
-		}, signal);
+		const speech = this.speech();
+		const form = new FormData();
+		form.set("model", speech.stt);
+		form.set("file", new Blob([new Uint8Array(await readFile(absolute))], { type: mimeOf(path) }), basename(path));
+		const response = await this.request(`${speech.base}/audio/transcriptions`, { method: "POST", headers: speech.headers, body: form }, signal);
 		const reply = parseWith(TranscriptReply, await response.json(), "transcription response");
-		const first = reply.results.channels[0]?.alternatives[0];
-		if (first === undefined) throw new Error("Transcription response is empty.");
-		const duration = reply.metadata?.duration;
-		return { text: first.transcript, ...(duration === undefined ? {} : { duration }) };
+		return { text: reply.text, ...(reply.duration === undefined ? {} : { duration: reply.duration }) };
 	}
 }
 
-async function loadImage(path: string, workDir: string): Promise<{ bytes: Buffer; name: string; mimeType: string }> {
-	return { bytes: await readFile(await workPath(path, workDir)), name: basename(path), mimeType: mimeOf(path) };
-}
-
-function imageExtension(bytes: Uint8Array): string {
-	const data = Buffer.from(bytes);
+function imageExtension(data: Buffer): string {
 	if (data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return "png";
 	if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return "jpg";
 	if (data.toString("ascii", 0, 4) === "RIFF" && data.toString("ascii", 8, 12) === "WEBP") return "webp";
