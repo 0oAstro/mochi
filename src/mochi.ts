@@ -30,6 +30,7 @@ import { fastBrowserFns } from "./browser/fast.ts";
 import type { MediaDeps } from "./media/client.ts";
 import { mediaFns } from "./media/media.ts";
 import { gifFns } from "./media/gif.ts";
+import { messageTool } from "./channels/message-tool.ts";
 import { defineProcWatch, PROC_POLL_MS, procFns } from "./procs/procs.ts";
 import { commandTask, runCommand } from "./turn/commands.ts";
 import { fastCompletion, handoffTool } from "./turn/lifecycle.ts";
@@ -55,8 +56,8 @@ interface MochiOptions {
 	/** The apps MCP server; absent, the apps functions say it is not connected. */
 	readonly apps?: Apps;
 	readonly index: SearchIndex;
-	/** Bundled skills, `<skillsDir>/<name>/SKILL.md`, listed in the prompt and opened with `read`. */
-	readonly skillsDir: string;
+	/** Skill directories, `<dir>/<name>/SKILL.md`: bundled first, then the owner's, which replace bundled ones by name. */
+	readonly skillDirs: readonly string[];
 	readonly profiles: Profiles;
 	/** Where bash, read, edit and write run when a conversation sets no cwd. */
 	readonly workDir: string;
@@ -97,8 +98,8 @@ export async function openMochi(options: MochiOptions, context: Context): Promis
 	const trigger = defineTrigger({ timeZone: options.timeZone, deadlineMs: RUN_DEADLINE_MS, log, harness: () => harness, catalog: options.profiles, classify: options.classify, workDir: options.workDir });
 	const procDir = join(options.workDir, ".procs");
 	const procWatch = defineProcWatch({ dir: procDir, workDir: options.workDir, harness: () => harness, line: lineOf, pollMs: PROC_POLL_MS, log });
-	const reply = defineReply(() => harness, options.workDir);
-	const forkTask = defineForkTask(options.workDir);
+	const reply = defineReply(() => harness, options.workDir, lineOf);
+	const forkTask = defineForkTask(options.workDir, lineOf);
 	const library: ToolRegistration[] = [
 		...(await codingTools()),
 		noteTool(index, ownerIn),
@@ -111,6 +112,7 @@ export async function openMochi(options: MochiOptions, context: Context): Promis
 		...fastBrowserFns({ ...browserDeps(options.web), models: options.models, fast: options.fast, classify: options.classify }),
 		...mediaFns({ ...media, workDir: options.workDir }),
 		...gifFns(options.workDir),
+		messageTool(options.channels),
 		...thinkFns({ models: options.models, ref: options.profiles.model, classify: options.classify }),
 		...appsFns(options.apps ?? NO_APPS),
 		...contextFns(options.workDir),
@@ -124,7 +126,7 @@ export async function openMochi(options: MochiOptions, context: Context): Promis
 	for (const extension of [
 		identityExtension([...options.channels.values()].map((channel) => channel.profile), users, [...a2aPeers.keys()]),
 		memoryExtension(ownerOf),
-		skillsExtension(options.skillsDir),
+		skillsExtension(options.skillDirs),
 		windowExtension(),
 		defineExtension({ name: "agents", tasks: [forkTask, reply] }),
 		defineExtension({ name: "procs", tasks: [procWatch] }),

@@ -1,4 +1,5 @@
 import { broken, off, ready, type Setup } from "../setup.ts";
+import type { EffectName } from "./directives.ts";
 
 export type ChatChannelId = "imessage" | "whatsapp";
 /** `cli` is a view, not a line: attached terminals render replies from the transcript, and nothing is delivered to it. */
@@ -8,7 +9,6 @@ export interface ChannelProfile {
 	readonly id: ChatChannelId;
 	readonly style: string;
 	readonly maxBubbles: number;
-	readonly maxBubbleChars: number;
 	readonly paragraphsAreBubbles: boolean;
 	/** The typing indicator stops after this long, so a long job is silent instead of "typing" for minutes. */
 	readonly typingMaxMs: number;
@@ -61,10 +61,22 @@ export type Inbound =
 export type InboundSink = (inbound: Inbound) => Promise<void>;
 
 export type Bubble =
-	| { readonly kind: "text"; readonly text: string }
+	/** `effect`: an iMessage send effect; other channels ignore it. */
+	| { readonly kind: "text"; readonly text: string; readonly effect?: EffectName }
 	/** A URL alone. iMessage renders a link card; other channels send the URL as text. */
 	| { readonly kind: "link"; readonly url: string }
-	| { readonly kind: "file"; readonly name: string; readonly mimeType: string; readonly bytes: Uint8Array };
+	/** `voice`: send audio as a voice message where the channel has one, else as a plain file. */
+	| { readonly kind: "file"; readonly name: string; readonly mimeType: string; readonly bytes: Uint8Array; readonly voice?: boolean };
+
+/** What the message tool asks of a channel beyond sending bubbles. A channel without `message` supports none of it. */
+export type MessageRequest =
+	| { readonly action: "sent" }
+	| { readonly action: "edit"; readonly messageId?: string; readonly text: string }
+	| { readonly action: "unsend"; readonly messageId?: string }
+	| { readonly action: "poll"; readonly title: string; readonly options: readonly string[] }
+	/** No fields: share mochi's own contact card. */
+	| { readonly action: "contact"; readonly name?: string; readonly phone?: string; readonly email?: string }
+	| { readonly action: "read" };
 
 export class DeliveryError extends Error {}
 /** The bubble never left: reconnecting, service unreachable, or the channel is not running in this process. Retry. */
@@ -88,6 +100,8 @@ export interface Channel {
 	send(bubble: Bubble, person?: string, options?: { readonly replyTo?: string }): Promise<void>;
 	typing(on: boolean, person?: string): Promise<void>;
 	react?(messageId: string, reaction: Reaction | "none"): Promise<void>;
+	/** Resolves to one line for the model. */
+	message?(request: MessageRequest): Promise<string>;
 }
 
 export type Channels = ReadonlyMap<ChatChannelId, Channel>;
@@ -98,7 +112,9 @@ export function attachmentKind(mimeType: string): Attachment["kind"] {
 	return "file";
 }
 
-/** Splits at the last newline or space before `limit`, never inside a surrogate pair. */
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Splits at the last newline or space before `limit`, else at the last grapheme boundary, so no emoji or letter breaks. */
 export function chunkText(text: string, limit: number): string[] {
 	const chunks: string[] = [];
 	let rest = text;
@@ -109,8 +125,13 @@ export function chunkText(text: string, limit: number): string[] {
 			rest = rest.slice(soft + 1);
 			continue;
 		}
-		const code = rest.charCodeAt(limit - 1);
-		const hard = code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit;
+		let hard = 0;
+		for (const { index, segment } of graphemes.segment(rest)) {
+			const end = index + segment.length;
+			if (end > limit && hard > 0) break;
+			hard = end;
+			if (end >= limit) break;
+		}
 		chunks.push(rest.slice(0, hard));
 		rest = rest.slice(hard);
 	}

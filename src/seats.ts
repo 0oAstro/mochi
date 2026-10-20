@@ -1,4 +1,4 @@
-import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { ModelThinkingLevel, ToolResultMessage } from "@earendil-works/pi-ai";
 import {
 	AgentDoc,
 	type ConversationId,
@@ -9,6 +9,7 @@ import {
 	type ModelRef,
 	type PromptSection,
 	ROOT_CONVERSATION_ID,
+	type ToolExecutionResult,
 	type ToolRegistration,
 	type Tx,
 } from "@earendil-works/pi-durable";
@@ -78,6 +79,7 @@ const LIBRARY: Readonly<Record<string, { readonly seats: readonly Seat[]; readon
 	gif_search: { seats: ALL, inline: false },
 	gif_save: { seats: ALL, inline: false },
 	transcribe: { seats: ALL, inline: false },
+	message: { seats: AGENT, inline: false },
 	proc_start: { seats: AGENT_TRIGGER, inline: false },
 	proc_status: { seats: AGENT_TRIGGER, inline: false },
 	proc_logs: { seats: AGENT_TRIGGER, inline: false },
@@ -93,6 +95,7 @@ const LIBRARY: Readonly<Record<string, { readonly seats: readonly Seat[]; readon
 	profile_list: { seats: AGENT, inline: false },
 	profile_send: { seats: AGENT, inline: true },
 	profile_update: { seats: AGENT, inline: false },
+	profile_stop: { seats: AGENT, inline: false },
 };
 
 const SHARED = ["identity", "notes", "skills", "fast-compaction"];
@@ -116,13 +119,26 @@ function withDeadline(code: string): string {
 }
 
 /**
+ * Anthropic rejects an `is_error` tool result that holds anything but text, and the rejected result stays in history,
+ * so every later turn fails. A failed script keeps the saved path of each image and drops the image block.
+ */
+function textOnlyWhenFailed(result: ToolExecutionResult): ToolExecutionResult {
+	if (result.isError !== true || result.output === undefined) return result;
+	const output: ToolResultMessage["content"] = [];
+	for (const item of result.output) {
+		if (item.type === "text") output.push(item);
+	}
+	return { ...result, output };
+}
+
+/**
  * One `seat-<seat>` extension per seat: its model tools, `codemode` with its prompt section, and the library tools its
  * scripts may call. Throws when the tables and the definitions disagree.
  */
 export function seatExtensions(modelTools: readonly ToolRegistration[], library: readonly ToolRegistration[], agentSections: readonly PromptSection[], everySeat: readonly PromptSection[]): Extension[] {
 	const codemode = createCodemodeExtension({ sandbox: new CodemodeSandbox({ memoryLimitBytes: SCRIPT_MEMORY_BYTES }), models: false });
 	const tool = codemode.tools![0]!;
-	const codemodeTool: ToolRegistration = { ...tool, execute: (args, api, context) => tool.execute({ code: withDeadline((args as { code: string }).code) }, api, context) };
+	const codemodeTool: ToolRegistration = { ...tool, execute: async (args, api, context) => textOnlyWhenFailed(await tool.execute({ code: withDeadline((args as { code: string }).code) }, api, context)) };
 	const disagree = [...drift([...modelTools.map((each) => each.name), "codemode"], SURFACE), ...drift(library.map((each) => each.name), LIBRARY)];
 	if (disagree.length > 0) throw new Error(`SURFACE, LIBRARY and the definitions disagree on ${disagree.join(", ")}.`);
 	return SEATS.map((seat) => {

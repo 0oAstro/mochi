@@ -88,7 +88,7 @@ The model sees three tools. `SURFACE` in `src/seats.ts` lists them:
 | Web | `web_search`, `web_fetch`, `web_map`, `web_find_tools`, `web_alexandria`, `browse`, `browse_fast` |
 | Apps | `apps_search`, `apps_call`, `apps_skills` |
 | Media | `image_gen`, `video_gen`, `speak`, `transcribe`, `gif_search`, `gif_save` |
-| Forks and profiles | `fork`, `fork_start`, `agent`, `profile_list`, `profile_send`, `profile_update` |
+| Forks and profiles | `fork`, `fork_start`, `agent`, `profile_list`, `profile_send`, `profile_stop`, `profile_update` |
 | Triggers | `trigger_add`, `trigger_list`, `trigger_remove` |
 | Board | `board_add`, `board_list`, `board_update`, `board_claim` |
 | Processes | `proc_start`, `proc_status`, `proc_logs`, `proc_stop` |
@@ -154,6 +154,10 @@ A profile is a standing teammate inside the daemon: `<home>/profiles/<name>/inst
 
 `profile_send({ name, message, background? })` submits to the profile's standing conversation (`mochi.profile` records it) and resolves to the answer, or returns at once with `background`. Each send writes the profile's model, instructions and tool list into its conversation, and records the conversation's owner in `mochi.profile-of`, so its memory section and its `note` calls use the profile's own memory log. `profile_update` writes a profile file.
 
+A busy profile queues a message (`whenBusy: "followUp"`) and `profile_send` returns at once with a result that starts with `NOT STARTED`. Queued messages merge into the profile's next turn, so they settle with one answer; `mochi.reply` keys each delivery by asker and answer (`mochi.reply-delivered`) and sends that answer back once.
+
+`profile_stop({ name })` aborts the profile's running turn, its queued submissions and the child tasks under its conversation, the same walk `/stop` does for root (`abortTargets` in `turn/commands.ts`). It does not stop processes, triggers or board tasks.
+
 ## Triggers
 
 A trigger is one durable `mochi.trigger` task in its own conversation. Its input is the definition, and its checkpoint holds the next slot, so the task record is the only copy of the schedule. Config seeds in `[[triggers]]` reconcile at start: an equal seed stays, a changed one is re-added, and a seed that is gone is aborted.
@@ -181,6 +185,13 @@ A run is the ordered `steps`. A classify step before the model step asks the cla
 The board (`mochi.board`) holds what mochi and its profiles owe. A task has an id, a title, an optional `due`, `bots` (root or profile names, the first leads), a status (`open`, `waiting`, `done`, `dropped`), a log, and an optional claim. `board_claim` takes a lease (default 2 hours) and fails while someone else holds a live one, so two workers never take the same task. Setting a task done or dropped clears its claim.
 
 The sweep (`mochi.board-sweep`) reads the board in code every 60 s and costs no model call unless a task is due. For a due task led by root, it forks root with the task as the brief. For a task led by a profile, it sends the brief to that profile. A woken task with no log line for 24 hours is woken again, at most 3 times per due time; the last wake asks for a notify that the task is stuck.
+
+
+## Self-improvement
+
+The `improve` trigger runs `skills/improve` nightly. It follows Harness² (recursive agent harnessing), with one change: mochi does not rerun a task to compare harnesses, because its tasks act on the world. Instead `scripts/improve-check.ts` counts failure signals per owner turn since the last run (busy sends, refused notify, side schedulers, lost children, timeouts, owner chases, duplicate replies) and writes the transcripts. The run judges each pending edit on its signal (helped, hurt, no observed effect, confounded), reverts a hurt one with git, then proposes from two dimensions (procedure and practice) with `llm` on the strongest model, composes at most 3 edits, and applies them.
+
+It edits only `<home>/skills` (which replaces a bundled skill of the same name) and `<home>/profiles`, one git commit in `<home>` per edit. Code and config changes go to the owner as proposals. `<home>/improve/library.md` keeps every edit, its verdict and at most one transferable lesson per run, and each run reads it first. A window with fewer than 10 owner turns is quiet and grows until the next run.
 
 ## Models and config
 

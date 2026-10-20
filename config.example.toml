@@ -27,15 +27,15 @@ keyEnv = "ANTHROPIC_API_KEY"
 brain = "anthropic/claude-opus-5-5"
 fast = "anthropic/claude-haiku-5-5"
 
-# Compact a conversation once a request uses this fraction of its model's context window.
-compactAt = 0.6
+# Compact a conversation once a request sends more than this many tokens.
+compactTokens = 80000
 
 # The yes/no classifier for classify and classify steps, on a provider with api = "classifier".
 # With none set, OPENROUTER_API_KEY alone turns on its default classifier.
 # classifier = "classifier/typesafe/jev-1.13"
 
 [models.aliases]
-sonnet = "anthropic/claude-sonnet-5-5"
+haiku = "anthropic/claude-haiku-5-5"
 
 # [providers.classifier]
 # api = "classifier"
@@ -96,3 +96,15 @@ sonnet = "anthropic/claude-sonnet-5-5"
 # keyEnv = "FIRECRAWL_API_KEY"
 # url = "https://api.firecrawl.dev/v2"
 # browserProfile = "mochi"
+
+# Nightly self-improvement (skills/improve): judges yesterday's skill edits by measured signals, then proposes,
+# applies and records new ones in <home>/improve/library.md. <home> must be a git repository.
+# [[triggers]]
+# kind = "cron"
+# id = "improve"
+# cron = "30 4 * * *"
+# tz = "Asia/Kolkata"
+# check = [ "node", "<repo>/scripts/improve-check.ts", "<home>", "24" ]
+# model = "strongest"
+# thinking = "high"
+# prompt = "Run the improve skill: read its SKILL.md from the skills index, then follow it with the check output below."

@@ -2,6 +2,7 @@ import type { Context } from "@earendil-works/chord";
 import { type Message, Type } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
+	ToolResultEntry,
 	CompactionTask,
 	type ConversationId,
 	defineDoc,
@@ -23,6 +24,7 @@ import {
 import type { SearchIndex } from "../index/fts.ts";
 import { messageText } from "../text.ts";
 import type { FastCompletion } from "../turn/lifecycle.ts";
+import { redact } from "./redact.ts";
 import { type Block, blockKey, cover, halves, pending, RAW_MAX } from "./tree.ts";
 
 // Two OptMem logs share one tree shape. The memory log holds lines the model chose to keep (`note`); a conversation's
@@ -76,10 +78,10 @@ const OldMemoryDoc = defineDoc<{ notes: Record<string, { subject: string; kind: 
 });
 
 function render(tree: Tree, [lo, hi]: Block): string {
-	if (hi - lo === 1) return `#${lo} ${tree.lines[lo]!.at} ${tree.lines[lo]!.text}`;
+	if (hi - lo === 1) return `#${lo} ${tree.lines[lo]!.at} ${clipBytes(tree.lines[lo]!.text, LINE_BYTES)}`;
 	const summary = tree.blocks[blockKey([lo, hi])];
-	if (summary !== undefined) return `#${lo}-${hi - 1} ${summary}`;
-	return tree.lines.slice(lo, hi).map((line, i) => `#${lo + i} ${line.at} ${line.text}`).join("\n");
+	if (summary !== undefined) return `#${lo}-${hi - 1} ${clipBytes(summary, LINE_BYTES)}`;
+	return tree.lines.slice(lo, hi).map((line, i) => `#${lo + i} ${line.at} ${clipBytes(line.text, LINE_BYTES)}`).join("\n");
 }
 
 function wake(tree: Tree, upTo = tree.lines.length): string {
@@ -102,9 +104,45 @@ function parseBlock(id: string): Block {
 	return [lo, hi];
 }
 
+/** Every line `merge()` makes fits in this many bytes of UTF-8; a turn line longer than this goes through `merge()`. */
+export const LINE_BYTES = 512;
+const MERGE_TRIES = 3;
+const TOOL_ARGS_CHARS = 120;
+const TOOL_RESULT_CHARS = 160;
+
+/** A ruler, not a sample line: a sample's content gets copied into the answer. */
+const RULER = "-".repeat(LINE_BYTES);
+
 const MERGE_SYSTEM =
-	"Merge the numbered lines into one line. Keep what has lasting effect: names, dates, numbers, decisions, promises, rules. " +
-	"Drop what does not. Invent nothing. Answer with the one line only.";
+	`Merge the input into one line of at most ${LINE_BYTES} bytes (about 70 words), the length of this ruler:\n${RULER}\n` +
+	"Keep what has lasting effect: rules, preferences, facts about people and projects. " +
+	"Invent nothing; keep names, dates, numbers, ids, decisions, promises, what was sent or submitted. " +
+	"Drop what does not last. Answer with the one line only.";
+
+const bytes = (text: string): number => Buffer.byteLength(text, "utf8");
+
+/** The longest head of `text` that fits in `max` bytes of UTF-8, cut on a character boundary. */
+export function clipBytes(text: string, max: number): string {
+	const buffer = Buffer.from(text, "utf8");
+	if (buffer.length <= max) return text;
+	let end = max;
+	while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end--;
+	return buffer.subarray(0, end).toString("utf8");
+}
+
+function clipChars(text: string, max: number): string {
+	if (text.length <= max) return text;
+	return `${text.slice(0, max).replace(/[\uD800-\uDBFF]$/, "")}…`;
+}
+
+const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
+
+function tooLong(line: string): string {
+	return (
+		`Too long: your last line was ${bytes(line)} bytes, over the ${LINE_BYTES}-byte limit. ` +
+		`Write the whole line again, cutting just enough of the least valuable items to fit before this cut:\n${clipBytes(line, LINE_BYTES)}| ← LIMIT`
+	);
+}
 
 /** The source a block's summary is made from: its raw lines while small, else its two halves' summaries. */
 function mergeInput(tree: Tree, block: Block): string | undefined {
@@ -116,20 +154,56 @@ function mergeInput(tree: Tree, block: Block): string | undefined {
 	return parts.map((part, i) => `#${part[0]}-${part[1] - 1} ${texts[i]}`).join("\n");
 }
 
-async function merge(fast: FastCompletion, input: string, context: Context): Promise<string> {
-	const text = await fast({ system: MERGE_SYSTEM, prompt: input }, context);
-	return text.replace(/\s+/g, " ").trim();
+/**
+ * One line of at most `LINE_BYTES` bytes. An answer too long is asked again with its size and where the limit cuts it,
+ * `MERGE_TRIES` answers in total, and the shortest is kept; one still too long is clipped.
+ */
+export async function merge(fast: FastCompletion, input: string, context: Context): Promise<string> {
+	let shortest: string | undefined;
+	let prompt = input;
+	for (let attempt = 0; attempt < MERGE_TRIES; attempt++) {
+		const line = oneLine(await fast({ system: MERGE_SYSTEM, prompt }, context));
+		if (shortest === undefined || bytes(line) < bytes(shortest)) shortest = line;
+		if (bytes(line) <= LINE_BYTES) break;
+		prompt = `${input}\n\n${tooLong(line)}`;
+	}
+	return clipBytes(shortest!, LINE_BYTES);
 }
 
-function turnLine(entries: readonly EntryRecord[]): string | undefined {
+/** A tool call in short form: its name and key arguments; for codemode, the script's head and the tools it calls. */
+function toolCallLine(name: string, args: Record<string, unknown>): string {
+	if (name === "codemode" && typeof args.code === "string") {
+		const calls: string[] = [];
+		for (const match of args.code.matchAll(/tools\.([A-Za-z_$][\w$]*)\s*\(/g)) {
+			const call = `tools.${match[1]}(`;
+			if (!calls.includes(call)) calls.push(call);
+		}
+		const head = clipChars(redact(oneLine(args.code)), TOOL_ARGS_CHARS);
+		return calls.length === 0 ? `codemode(${head})` : `codemode(${head}) calls ${calls.join(" ")}`;
+	}
+	const pairs: string[] = [];
+	for (const [key, value] of Object.entries(args)) pairs.push(`${key}=${typeof value === "string" ? value : JSON.stringify(value)}`);
+	return `${name}(${clipChars(redact(oneLine(pairs.join(", "))), TOOL_ARGS_CHARS)})`;
+}
+
+/** The turn's words and what was done in it: the owner's text, mochi's text, each tool call and the head of its result. */
+export function turnLine(entries: readonly EntryRecord[]): string | undefined {
 	const parts: string[] = [];
 	for (const entry of entries) {
 		const message = entry.model?.[0];
 		if (message === undefined) continue;
-		const text = messageText(message).replace(/\s+/g, " ").trim();
-		if (text === "") continue;
-		if (UserEntry.is(entry)) parts.push(`owner: ${text}`);
-		else if (AssistantEntry.is(entry)) parts.push(`mochi: ${text}`);
+		const text = oneLine(messageText(message));
+		if (UserEntry.is(entry)) {
+			if (text !== "") parts.push(`owner: ${text}`);
+		} else if (AssistantEntry.is(entry) && message.role === "assistant") {
+			if (text !== "") parts.push(`mochi: ${text}`);
+			for (const part of message.content) {
+				if (part.type === "toolCall") parts.push(`tool ${toolCallLine(part.name, part.arguments)}`);
+			}
+		} else if (ToolResultEntry.is(entry) && message.role === "toolResult") {
+			const head = clipChars(redact(text), TOOL_RESULT_CHARS);
+			parts.push(`${message.toolName} ${message.isError ? "error" : "result"}: ${head === "" ? "(no text)" : head}`);
+		}
 	}
 	return parts.length === 0 ? undefined : parts.join(" | ");
 }
@@ -162,7 +236,7 @@ async function foldTurns(harness: Harness, fast: FastCompletion, conversation: C
 	for (const turn of turns) {
 		const raw = turnLine(turn);
 		const upTo = turn.at(-1)!.id;
-		const line = raw === undefined ? undefined : raw.length <= 280 ? raw : await merge(fast, raw, context);
+		const line = raw === undefined ? undefined : bytes(raw) <= LINE_BYTES ? raw : await merge(fast, raw, context);
 		await harness.commit(async (tx) => {
 			const doc = await tx.doc(TurnLog, conversation);
 			if (doc.upTo >= upTo) return;
@@ -183,11 +257,18 @@ async function keepsHistory(harness: Harness, conversation: ConversationId, cont
 	return !(Array.isArray(extensions) && extensions.includes("seat-trigger"));
 }
 
-/** Builds every block that is due, smallest first, one commit each, so a crash resumes at the next missing block. */
+/**
+ * Builds every block that is due, smallest first, one commit each, so a crash resumes at the next missing block. A summary
+ * over `LINE_BYTES`, written before that limit, counts as missing and is written again.
+ */
 async function buildBlocks(read: () => Promise<Tree>, write: (key: string, summary: string) => Promise<void>, fast: FastCompletion, context: Context): Promise<void> {
 	for (;;) {
 		const tree = await read();
-		const next = pending(tree.lines.length, (block) => tree.blocks[blockKey(block)] !== undefined)[0];
+		const built = (block: Block): boolean => {
+			const summary = tree.blocks[blockKey(block)];
+			return summary !== undefined && bytes(summary) <= LINE_BYTES;
+		};
+		const next = pending(tree.lines.length, built)[0];
 		if (next === undefined) return;
 		const input = mergeInput(tree, next);
 		if (input === undefined) return;
@@ -235,8 +316,7 @@ export function noteTool(index: SearchIndex, ownerOf: OwnerOf) {
 	return defineTool({
 		name: "note",
 		description:
-			"Keep one line in memory for good: a fact about the owner, their people or projects, a preference, a standing rule, a decision, " +
-			"or an event of lasting effect. New conversations see it in the memory section; this one sees it from the next compaction. Do not repeat what memory already holds.",
+			"Keep one line in memory for good: a lasting fact, preference, rule or decision about the owner, their people or projects. New conversations see it at once; this one after the next compaction. Skip what memory already holds.",
 		parameters: Type.Object({ line: Type.String({ minLength: 1 }) }),
 		replay: "safe",
 		execute: async ({ line }, api, context) => {
@@ -277,8 +357,7 @@ export function recallTool(index: SearchIndex) {
 	return defineTool({
 		name: "recall",
 		description:
-			"Search memory and past chats by words, the owner's chat first. Search before you say the owner never told you something. " +
-			"Pass entry instead of query to read the messages around one chat hit.",
+			"Search memory and past chats by words, the owner's chat first. entry instead of query reads the messages around one hit.",
 		parameters: Type.Object({
 			query: Type.Optional(Type.String()),
 			entry: Type.Optional(Type.Integer({ minimum: 1 })),
